@@ -132,6 +132,62 @@ private slots:
         QCOMPARE(cache.processes, 6);
     }
 
+    void blankPasswordsDefaultToPostgres()
+    {
+        QCOMPARE(passwordFor("postgres", ""), QString("postgres"));
+        QCOMPARE(passwordFor("mysql", ""), QString("postgres"));
+        QCOMPARE(passwordFor("redis", "typed-one"), QString("typed-one"));
+        // SQL Server refuses it, so it gets a strong one.
+        QCOMPARE(passwordFor("mssql", "").size(), 20);
+        QVERIFY(passwordProblem("mssql", passwordFor("mssql", "")).isEmpty());
+    }
+
+    void createsEachVersion()
+    {
+        const Engine *postgres = engineById("postgres");
+        // Before 18, PostgreSQL keeps its data a level down, where its volume is.
+        QVERIFY(createArgs(*postgres, "old", 5432, "pw", "16").contains("depot-old:/var/lib/postgresql/data"));
+        QVERIFY(createArgs(*postgres, "new", 5432, "pw", "18").contains("depot-new:/var/lib/postgresql"));
+        QCOMPARE(createArgs(*postgres, "old", 5432, "pw", "16").last(), QString("postgres:16"));
+        QCOMPARE(createArgs(*engineById("mssql"), "sql", 1433, "pw", "2019").last(),
+                 QString("mcr.microsoft.com/mssql/server:2019-latest"));
+        QCOMPARE(engineById("redis")->image(), QString("redis:7"));
+        QVERIFY(engineById("mysql")->version("5.7") == nullptr);
+    }
+
+    void handlesClickHouse()
+    {
+        // A container like one made by hand: HTTP and native ports, no password.
+        const auto databases = parseInspect(R"([{"Id": "c", "Name": "/clickhouse",
+            "Config": {"Image": "clickhouse/clickhouse-server:25.8", "Labels": {}},
+            "State": {"Status": "exited"},
+            "HostConfig": {"PortBindings": {"8123/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8123"}],
+                                            "9000/tcp": [{"HostIp": "127.0.0.1", "HostPort": "9000"}]}}}])");
+        QCOMPARE(databases.size(), 1);
+        QCOMPARE(databases[0].engine, QString("clickhouse"));
+        QCOMPARE(databases[0].port, 8123);
+        QCOMPARE(databases[0].ports(), (QList<int>{8123, 9000}));
+        QCOMPARE(connectionUrl(databases[0], "box"), QString("http://default@box:8123"));
+
+        const auto args = createArgs(*engineById("clickhouse"), "events", 8124, "pw", "24.8", {9001});
+        QVERIFY(args.contains("127.0.0.1:8124:8123"));
+        QVERIFY(args.contains("127.0.0.1:9001:9000"));
+        QVERIFY(args.contains("depot-events:/var/lib/clickhouse"));
+        QVERIFY(args.contains("CLICKHOUSE_PASSWORD=pw"));
+        QVERIFY(args.contains("nofile=262144:262144"));
+        QCOMPARE(args.last(), QString("clickhouse/clickhouse-server:24.8"));
+    }
+
+    void checksTypedPasswords()
+    {
+        QVERIFY(passwordProblem("postgres", "").isEmpty());          // Generated
+        QVERIFY(passwordProblem("postgres", "secret12").isEmpty());
+        QVERIFY(!passwordProblem("postgres", "short").isEmpty());
+        QVERIFY(!passwordProblem("redis", "has a space").isEmpty());
+        QVERIFY(!passwordProblem("mssql", "alllowercase1").isEmpty()); // Two kinds only
+        QVERIFY(passwordProblem("mssql", "Mixed-case1").isEmpty());
+    }
+
     void generatesStrongPasswords()
     {
         const QRegularExpression shape("^[A-Za-z0-9]{20}$");
@@ -178,7 +234,7 @@ private slots:
 
         auto app = backend.databases().value(0).toMap();
         QCOMPARE(app.value("name").toString(), QString("app"));
-        QCOMPARE(app.value("password").toString().size(), 20);
+        QCOMPARE(app.value("password").toString(), QString("postgres"));
         QVERIFY(app.value("url").toString().startsWith("postgresql://postgres:"));
         QVERIFY(app.value("url").toString().endsWith(QString("@workstation.tail1234.ts.net:%1/postgres").arg(port)));
         QVERIFY(!backend.nameProblem("app").isEmpty());
@@ -204,6 +260,18 @@ private slots:
         QFile serve(state.path() + "/serve.json");
         QVERIFY(serve.open(QIODevice::ReadOnly));
         QCOMPARE(QJsonDocument::fromJson(serve.readAll()).object().size(), 0);
+    }
+
+    void backendUsesATypedPassword()
+    {
+        QTemporaryDir state;
+        qputenv("FAKE_STATE", state.path().toUtf8());
+        Backend backend(FAKES "/docker", FAKES "/tailscale", nullptr, 0);
+        backend.refresh();
+        QTRY_VERIFY(backend.loaded());
+        QVERIFY(!backend.passwordProblem("postgres", "abc").isEmpty());
+        backend.create("postgres", "typed", backend.suggestPort("postgres"), false, "my-pass-123");
+        QTRY_COMPARE(backend.databases().value(0).toMap().value("password").toString(), QString("my-pass-123"));
     }
 
     void backendSamplesUsage()
@@ -275,16 +343,52 @@ private slots:
                 .toObject().value("result").toObject();
         };
 
+        // ClickHouse shares and stops sharing both of its ports.
+        auto ch = call("create_database", {{"engine", "clickhouse"}, {"name", "events"}, {"share_on_tailnet", true}});
+        QVERIFY(!ch.value("isError").toBool());
+        // The ports are the usual ones unless something here already holds them.
+        const auto chDatabase = ch.value("structuredContent").toObject().value("database").toObject();
+        const int httpPort = chDatabase.value("port").toInt();
+        const int nativePort = chDatabase.value("extra_ports").toObject().value("native").toInt();
+        QVERIFY(httpPort >= 8123 && nativePort >= 9000);
+        auto servedPorts = [&] {
+            QFile serve(state.path() + "/serve.json");
+            return serve.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(serve.readAll()).object().keys() : QStringList();
+        };
+        QStringList expected{QString::number(httpPort), QString::number(nativePort)};
+        expected.sort();
+        auto served = servedPorts();
+        served.sort();
+        QCOMPARE(served, expected);
+        QVERIFY(!call("share_database", {{"name", "events"}, {"shared", false}}).value("isError").toBool());
+        QCOMPARE(servedPorts(), QStringList());
+        QVERIFY(!call("share_database", {{"name", "events"}, {"shared", true}}).value("isError").toBool());
+        QVERIFY(!call("remove_database", {{"name", "events"}}).value("isError").toBool());
+        QCOMPARE(servedPorts(), QStringList());
+
+        // An unknown version is refused; a listed one is used.
+        QVERIFY(call("create_database", {{"engine", "postgres"}, {"name", "old"}, {"version", "9.6"}}).value("isError").toBool());
+        auto older = call("create_database", {{"engine", "postgres"}, {"name", "pg16"}, {"version", "16"}});
+        QCOMPARE(older.value("structuredContent").toObject().value("database").toObject().value("image").toString(), QString("postgres:16"));
+        QVERIFY(!call("remove_database", {{"name", "pg16"}}).value("isError").toBool());
+
+        // A typed password is kept; a weak one is refused before anything runs.
+        QVERIFY(call("create_database", {{"engine", "postgres"}, {"name", "weak"}, {"password", "abc"}}).value("isError").toBool());
+        auto typed = call("create_database", {{"engine", "postgres"}, {"name", "typed"}, {"password", "my-pass-123"}});
+        QCOMPARE(typed.value("structuredContent").toObject().value("connection").toObject().value("password").toString(),
+                 QString("my-pass-123"));
+        QVERIFY(!call("remove_database", {{"name", "typed"}}).value("isError").toBool());
+
         // Created without sharing unless asked.
         auto created = call("create_database", {{"engine", "redis"}, {"name", "cache"}});
         QVERIFY(!created.value("isError").toBool());
         const auto content = created.value("structuredContent").toObject();
         QVERIFY(!content.value("database").toObject().value("shared_on_tailnet").toBool());
-        QCOMPARE(content.value("connection").toObject().value("password").toString().size(), 20);
+        QCOMPARE(content.value("connection").toObject().value("password").toString(), QString("postgres"));
 
         // The listing never carries passwords.
         auto listed = call("list_databases", {});
-        QVERIFY(!QJsonDocument(listed).toJson().contains(content.value("connection").toObject().value("password").toString().toUtf8()));
+        QVERIFY(!QJsonDocument(listed).toJson().contains("\"password\""));
         QCOMPARE(listed.value("structuredContent").toObject().value("databases").toArray().size(), 1);
 
         QVERIFY(call("get_connection", {{"name", "cache"}, {"from", "tailnet"}}).value("isError").toBool());

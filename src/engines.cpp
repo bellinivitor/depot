@@ -13,15 +13,75 @@
 const QList<Engine> &engines() {
     // Images and defaults match omarchy-install-docker-dbs, so databases made
     // there and here behave alike.
+    // The defaults match omarchy-install-docker-dbs, so databases made there
+    // and here behave alike; the others are the versions still maintained
+    // upstream, each checked to exist on its registry.
     static const QList<Engine> list{
-        {"postgres", "PostgreSQL", "postgres:18", 5432, "/var/lib/postgresql", "postgres", ""},
-        {"mysql", "MySQL", "mysql:8.4", 3306, "/var/lib/mysql", "root", ""},
-        {"mariadb", "MariaDB", "mariadb:11.8", 3306, "/var/lib/mysql", "root", ""},
-        {"redis", "Redis", "redis:7", 6379, "/data", "default", ""},
-        {"mongo", "MongoDB", "mongo:noble", 27017, "/data/db", "admin", "admin123"},
-        {"mssql", "SQL Server", "mcr.microsoft.com/mssql/server:2022-latest", 1433, "/var/opt/mssql", "sa", "@dmin123"},
+        {"postgres", "PostgreSQL", "postgres",
+         {{"18", "18"}, {"17", "17"}, {"16", "16"}, {"15", "15"}, {"14", "14"}, {"13", "13"}},
+         5432, "/var/lib/postgresql", "postgres", ""},
+        {"mysql", "MySQL", "mysql", {{"8.4", "8.4"}, {"9", "9"}, {"8.0", "8.0"}},
+         3306, "/var/lib/mysql", "root", ""},
+        {"mariadb", "MariaDB", "mariadb",
+         {{"11.8", "11.8"}, {"12", "12"}, {"11.4", "11.4"}, {"10.11", "10.11"}, {"10.6", "10.6"}},
+         3306, "/var/lib/mysql", "root", ""},
+        {"redis", "Redis", "redis", {{"7", "7"}, {"8", "8"}, {"6.2", "6.2"}},
+         6379, "/data", "default", ""},
+        {"mongo", "MongoDB", "mongo", {{"8.2", "8.2"}, {"8.0", "8.0"}, {"7.0", "7.0"}, {"6.0", "6.0"}},
+         27017, "/data/db", "admin", "admin123"},
+        {"mssql", "SQL Server", "mcr.microsoft.com/mssql/server",
+         {{"2022", "2022-latest"}, {"2025", "2025-latest"}, {"2019", "2019-latest"}, {"2017", "2017-latest"}},
+         1433, "/var/opt/mssql", "sa", "@dmin123"},
+        // HTTP on 8123 is what most drivers and DBeaver use; the native
+        // protocol on 9000 is what clickhouse-client speaks.
+        {"clickhouse", "ClickHouse", "clickhouse/clickhouse-server",
+         {{"25.8", "25.8"}, {"25.10", "25.10"}, {"25.9", "25.9"}, {"25.3", "25.3"}, {"24.8", "24.8"}},
+         8123, "/var/lib/clickhouse", "default", "", {{"native", 9000}}},
     };
     return list;
+}
+
+const EngineVersion *Engine::version(const QString &label) const {
+    if (label.isEmpty())
+        return versions.isEmpty() ? nullptr : &versions.first();
+    for (const auto &candidate : versions)
+        if (candidate.label == label)
+            return &candidate;
+    return nullptr;
+}
+
+QString Engine::image(const QString &label) const {
+    const EngineVersion *chosen = version(label);
+    return repository + ":" + (chosen ? chosen->tag : QString("latest"));
+}
+
+QString Engine::dataPathFor(const QString &label) const {
+    // Up to 17 the image keeps its data, and declares its volume, one level
+    // down. Mounting the parent would leave the data in an anonymous volume
+    // that removing the container orphans.
+    if (id == "postgres") {
+        const EngineVersion *chosen = version(label);
+        if (chosen && chosen->label.toInt() < 18)
+            return "/var/lib/postgresql/data";
+    }
+    return dataPath;
+}
+
+QStringList engineIds() {
+    QStringList ids;
+    for (const auto &engine : engines())
+        ids << engine.id;
+    return ids;
+}
+
+QList<int> Database::ports() const {
+    QList<int> all;
+    if (port > 0)
+        all << port;
+    for (const auto &extra : extraPorts)
+        if (extra.second > 0)
+            all << extra.second;
+    return all;
 }
 
 const Engine *engineById(const QString &id) {
@@ -42,9 +102,10 @@ const Engine *engineForImage(const QString &image) {
         if (repository.startsWith(prefix))
             repository.remove(0, prefix.size());
 
-    if (repository.endsWith("mssql/server"))
-        return engineById("mssql");
-    return engineById(repository);
+    for (const auto &engine : engines())
+        if (repository == engine.repository || repository == engine.id)
+            return &engine;
+    return nullptr;
 }
 
 QList<Database> parseInspect(const QByteArray &json) {
@@ -72,16 +133,22 @@ QList<Database> parseInspect(const QByteArray &json) {
 
         // Port bindings live in HostConfig, so a stopped container still
         // reports the port it will come back on.
-        const auto bindings = container.value("HostConfig").toObject().value("PortBindings").toObject()
-                                  .value(QString::number(engine->port) + "/tcp").toArray();
-        for (const auto &binding : bindings) {
-            const auto port = binding.toObject().value("HostPort").toString().toInt();
-            if (port > 0) {
-                database.port = port;
-                database.hostIp = binding.toObject().value("HostIp").toString();
-                break;
+        const auto portBindings = container.value("HostConfig").toObject().value("PortBindings").toObject();
+        auto hostPort = [&](int containerPort, QString *hostIp) {
+            for (const auto &binding : portBindings.value(QString::number(containerPort) + "/tcp").toArray()) {
+                const auto port = binding.toObject().value("HostPort").toString().toInt();
+                if (port > 0) {
+                    if (hostIp)
+                        *hostIp = binding.toObject().value("HostIp").toString();
+                    return port;
+                }
             }
-        }
+            return 0;
+        };
+        database.port = hostPort(engine->port, &database.hostIp);
+        for (const auto &extra : engine->extraPorts)
+            if (const int port = hostPort(extra.port, nullptr); port > 0)
+                database.extraPorts.append({extra.key, port});
         result.append(database);
     }
     std::sort(result.begin(), result.end(), [](const Database &a, const Database &b) { return a.name < b.name; });
@@ -152,12 +219,16 @@ Tailnet parseTailnet(const QByteArray &statusJson) {
     return tailnet;
 }
 
-QStringList createArgs(const Engine &engine, const QString &name, int port, const QString &password) {
+QStringList createArgs(const Engine &engine, const QString &name, int port, const QString &password,
+                       const QString &version, const QList<int> &extraHostPorts) {
     QStringList args{"run", "-d", "--restart", "unless-stopped", "--name", name,
-                     "-p", QString("127.0.0.1:%1:%2").arg(port).arg(engine.port),
-                     "-v", volumeName(name) + ":" + engine.dataPath,
-                     "--label", "depot.engine=" + engine.id,
-                     "--label", "depot.password=" + password};
+                     "-p", QString("127.0.0.1:%1:%2").arg(port).arg(engine.port)};
+    for (int i = 0; i < engine.extraPorts.size(); ++i)
+        args << "-p" << QString("127.0.0.1:%1:%2").arg(extraHostPorts.value(i, engine.extraPorts[i].port))
+                                                   .arg(engine.extraPorts[i].port);
+    args << "-v" << volumeName(name) + ":" + engine.dataPathFor(version)
+         << "--label" << "depot.engine=" + engine.id
+         << "--label" << "depot.password=" + password;
 
     QStringList command;
     if (engine.id == "postgres")
@@ -172,8 +243,13 @@ QStringList createArgs(const Engine &engine, const QString &name, int port, cons
         args << "-e" << "ACCEPT_EULA=Y" << "-e" << "MSSQL_PID=Developer" << "-e" << "MSSQL_SA_PASSWORD=" + password;
     else if (engine.id == "redis")
         command << "redis-server" << "--requirepass" << password << "--appendonly" << "yes";
+    else if (engine.id == "clickhouse")
+        // The password goes to the default user; ClickHouse asks for the
+        // higher open-file limit in its own docs.
+        args << "-e" << "CLICKHOUSE_PASSWORD=" + password << "-e" << "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1"
+             << "--ulimit" << "nofile=262144:262144";
 
-    return args << engine.image << command;
+    return args << engine.image(version) << command;
 }
 
 // Targets 127.0.0.1 rather than localhost: Docker publishes on IPv4 only, and
@@ -202,6 +278,9 @@ QString connectionUrl(const Database &database, const QString &host) {
         return database.password.isEmpty() ? "redis://" + address : QString("redis://:%1@%2").arg(password, address);
     if (engine->id == "mongo")
         return QString("mongodb://%1@%2").arg(credentials, address);
+    if (engine->id == "clickhouse")
+        return database.password.isEmpty() ? QString("http://%1@%2").arg(engine->user, address)
+                                            : QString("http://%1:%2@%3").arg(engine->user, password, address);
     if (engine->id == "mssql")
         return QString("Server=%1,%2;User Id=sa;Password=%3;TrustServerCertificate=True")
             .arg(host).arg(database.port).arg(database.password);
@@ -225,12 +304,43 @@ QString generatePassword(int length) {
     }
 }
 
+QString blankPassword(const QString &engine) {
+    // SQL Server won't start with a password of one kind of character.
+    return engine == "mssql" ? QString() : QString("postgres");
+}
+
+QString passwordFor(const QString &engine, const QString &typed) {
+    if (!typed.isEmpty())
+        return typed;
+    const QString blank = blankPassword(engine);
+    return blank.isEmpty() ? generatePassword() : blank;
+}
+
 QString nameProblem(const QString &name) {
     if (name.isEmpty())
         return QCoreApplication::translate("Depot", "Give it a name.");
     static const QRegularExpression valid("^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$");
     if (!valid.match(name).hasMatch())
         return QCoreApplication::translate("Depot", "Use letters, digits, dots, dashes, and underscores.");
+    return {};
+}
+
+QString passwordProblem(const QString &engine, const QString &password) {
+    if (password.isEmpty())
+        return {};
+    // Shared on a tailnet, a short password is a door left ajar.
+    if (password.size() < 8)
+        return QCoreApplication::translate("Depot", "Use at least 8 characters.");
+    if (password.contains(QRegularExpression("\\s")))
+        return QCoreApplication::translate("Depot", "Leave out spaces.");
+    if (engine == "mssql") {
+        // SQL Server refuses to start without three of the four kinds.
+        int kinds = 0;
+        for (const char *kind : {"[A-Z]", "[a-z]", "[0-9]", "[^A-Za-z0-9]"})
+            kinds += password.contains(QRegularExpression(kind));
+        if (kinds < 3)
+            return QCoreApplication::translate("Depot", "SQL Server needs three of: uppercase, lowercase, digits, symbols.");
+    }
     return {};
 }
 
@@ -260,5 +370,11 @@ QVariantMap toVariant(const Database &database, bool exposed, const Tailnet &tai
         {"ip", tailnet.ip},
         {"url", host.isEmpty() ? QString() : connectionUrl(database, host)},
         {"localUrl", connectionUrl(database, "127.0.0.1")},
+        {"extraPorts", [&] {
+             QVariantList list;
+             for (const auto &extra : database.extraPorts)
+                 list.append(QVariantMap{{"key", extra.first}, {"port", extra.second}});
+             return list;
+         }()},
     };
 }

@@ -35,8 +35,10 @@ struct Created {
     bool shared = false;
 };
 
-// Port 0 picks the engine's default, or the next free one after it.
-Created create(const Snapshot &now, const QString &engine, const QString &name, int port, bool share);
+// Port 0 picks the engine's default, or the next free one after it; an empty
+// password is generated.
+Created create(const Snapshot &now, const QString &engine, const QString &name, int port, bool share,
+               const QString &password = {}, const QString &version = {});
 
 // Each returns an empty string on success, otherwise what went wrong.
 QString setRunning(const Snapshot &now, const QString &name, bool running);

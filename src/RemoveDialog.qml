@@ -14,6 +14,12 @@ Dialog {
     font.family: theme.font
     Material.roundedScale: theme.radius
     Material.background: theme.surface
+    // Material dims the window with a pale wash in dark mode; darken it
+    // instead, so the dialog stands out and the window stays in its colors.
+    Overlay.modal: Rectangle {
+        color: theme.tint("#000000", theme.dark ? 0.55 : 0.3)
+        Behavior on opacity { NumberAnimation { duration: 120 } }
+    }
     Material.accent: theme.red
 
     property var db: null

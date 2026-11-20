@@ -19,6 +19,18 @@ const char *instructions =
     "Use list_databases first. get_connection returns credentials; only fetch them when you need to connect. "
     "Ask the user before remove_database, and before sharing a database that has no password.";
 
+// Which versions each engine offers, for the agent to pick from.
+QString versionsDescription() {
+    QStringList lines;
+    for (const auto &engine : engines()) {
+        QStringList labels;
+        for (const auto &version : engine.versions)
+            labels << version.label;
+        lines << QString("%1: %2").arg(engine.id, labels.join(", "));
+    }
+    return "Version to run; leave it out for the first, the default. " + lines.join("; ") + ".";
+}
+
 QJsonObject schema(const QJsonObject &properties, const QStringList &required = {}) {
     QJsonObject result{{"type", "object"}, {"properties", properties}, {"additionalProperties", false}};
     if (!required.isEmpty())
@@ -60,6 +72,14 @@ QString size(double bytes) {
     return QLocale::c().formattedDataSize(qint64(bytes), 1, QLocale::DataSizeIecFormat);
 }
 
+// ClickHouse's native protocol port, and any like it: {"native": 9000}.
+QJsonObject extraPorts(const Database &database) {
+    QJsonObject ports;
+    for (const auto &extra : database.extraPorts)
+        ports[extra.first] = extra.second;
+    return ports;
+}
+
 QJsonObject describe(const Database &database, const ops::Snapshot &now) {
     const Engine *engine = engineById(database.engine);
     return {
@@ -74,6 +94,7 @@ QJsonObject describe(const Database &database, const ops::Snapshot &now) {
         {"created_by_depot", database.managed},
         {"has_password", !database.password.isEmpty()},
         {"published_on_all_interfaces", database.port > 0 && (database.hostIp.isEmpty() || database.hostIp == "0.0.0.0")},
+        {"extra_ports", extraPorts(database)},
     };
 }
 
@@ -88,6 +109,7 @@ QJsonObject connection(const Database &database, const QString &host, const QStr
         {"user", engine ? engine->user : QString()},
         {"password", database.password},
         {"url", connectionUrl(database, host)},
+        {"extra_ports", extraPorts(database)},
     };
 }
 
@@ -108,7 +130,8 @@ QJsonObject callTool(const QString &name, const QJsonObject &args) {
 
     if (name == "create_database") {
         const bool share = args.value("share_on_tailnet").toBool(false);
-        const auto created = ops::create(now, args.value("engine").toString(), target, args.value("port").toInt(0), share);
+        const auto created = ops::create(now, args.value("engine").toString(), target, args.value("port").toInt(0), share,
+                                         args.value("password").toString(), args.value("version").toString());
         if (!created.error.isEmpty() && created.database.name.isEmpty())
             return failure(created.error);
         QJsonObject data{{"database", describe(created.database, now)},
@@ -211,10 +234,12 @@ QStringList supportedVersions() {
 }
 
 QJsonArray tools() {
+    QStringList labels;
+    for (const auto &each : engines())
+        labels << QString("%1 (%2)").arg(each.id, each.label);
     const QJsonObject engine{{"type", "string"},
-                             {"enum", QJsonArray{"postgres", "mysql", "mariadb", "redis", "mongo", "mssql"}},
-                             {"description", "postgres (PostgreSQL 18), mysql (MySQL 8.4), mariadb (MariaDB 11.8), "
-                                             "redis (Redis 7), mongo (MongoDB), or mssql (SQL Server 2022)."}};
+                             {"enum", QJsonArray::fromStringList(engineIds())},
+                             {"description", "One of " + labels.join(", ") + "."}};
     return {
         tool("list_databases", "List databases",
              "Lists every database container on this machine, whether Depot created it or not: engine, state, "
@@ -237,7 +262,7 @@ QJsonArray tools() {
              schema({{"name", nameProperty("The database's name.")}}, {"name"}),
              annotations("Get hardware usage", true, false, true)),
         tool("create_database", "Create a database",
-             "Creates and starts a new database with a generated password and its data in the Docker volume "
+             "Creates and starts a new database with the password given, or \"postgres\" by default, and its data in the Docker volume "
              "depot-<name>. It listens on 127.0.0.1 only. Set share_on_tailnet to also let the user's other "
              "devices reach it. Returns the connection details, password included. The first database of an "
              "engine downloads its image, which can take minutes.",
@@ -247,7 +272,12 @@ QJsonArray tools() {
                      {"port", QJsonObject{{"type", "integer"}, {"minimum", 1024}, {"maximum", 65535},
                                           {"description", "Host port. Defaults to the engine's usual port, or the next free one."}}},
                      {"share_on_tailnet", QJsonObject{{"type", "boolean"}, {"default", false},
-                                                      {"description", "Share it on the tailnet right away."}}}},
+                                                      {"description", "Share it on the tailnet right away."}}},
+                     {"version", QJsonObject{{"type", "string"}, {"description", versionsDescription()}}},
+                     {"password", QJsonObject{{"type", "string"},
+                                              {"description", "At least 8 characters, no spaces. Left out, the password is "
+                                                              "\"postgres\" (SQL Server gets a generated one instead). Set a "
+                                                              "strong one when the user wants it shared beyond their own devices."}}}},
                     {"engine"}),
              annotations("Create a database", false, false, false)),
         tool("start_database", "Start a database", "Starts a stopped database. Does nothing if it already runs.",

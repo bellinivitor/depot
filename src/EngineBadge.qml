@@ -8,13 +8,14 @@ Rectangle {
     property string engine: ""
     property int size: 36
 
-    readonly property var initials: ({ postgres: "PG", mysql: "MY", mariadb: "MA", redis: "RD", mongo: "MG", mssql: "MS" })
+    readonly property var initials: ({ postgres: "PG", mysql: "MY", mariadb: "MA", redis: "RD", mongo: "MG", mssql: "MS", clickhouse: "CH" })
     readonly property color hue: engine === "postgres" ? theme.blue
         : engine === "mysql" ? theme.orange
         : engine === "mariadb" ? theme.cyan
         : engine === "redis" ? theme.red
         : engine === "mongo" ? theme.green
-        : engine === "mssql" ? theme.magenta : theme.textDim
+        : engine === "mssql" ? theme.magenta
+        : engine === "clickhouse" ? theme.yellow : theme.textDim
 
     width: size
     height: size

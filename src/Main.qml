@@ -357,37 +357,18 @@ ApplicationWindow {
                             }
                         }
 
-                        ColumnLayout {
-                            visible: backend.loaded && backend.names.length === 0 && backend.dockerProblem === ""
-                            Layout.fillWidth: true
-                            Layout.bottomMargin: 120
-                            spacing: 6
-                            Label {
-                                Layout.alignment: Qt.AlignHCenter
-                                text: "󰆼"
-                                font.pixelSize: 34
-                                color: theme.border
-                            }
-                            Label {
-                                Layout.alignment: Qt.AlignHCenter
-                                text: qsTr("No databases yet")
-                                color: theme.text
-                            }
-                            Label {
-                                Layout.alignment: Qt.AlignHCenter
-                                text: qsTr("Press N to create one")
-                                font.pixelSize: 12
-                                color: theme.textDim
-                            }
-                        }
                     }
                 }
 
-                // The selected database.
-                ScrollView {
-                    id: detailScroll
+                // The selected database, or, with none, an invitation to make one.
+                Item {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
+
+                ScrollView {
+                    id: detailScroll
+                    anchors.fill: parent
+                    visible: win.selected !== null
                     clip: true
                     contentWidth: availableWidth
 
@@ -654,8 +635,17 @@ ApplicationWindow {
                                         onReveal: win.revealPassword = !win.revealPassword
                                     }
                                     ConnectionField {
-                                        label: qsTr("Port")
+                                        label: win.selected && win.selected.extraPorts && win.selected.extraPorts.length > 0
+                                               ? qsTr("HTTP port") : qsTr("Port")
                                         value: win.selected && win.selected.port > 0 ? String(win.selected.port) : ""
+                                    }
+                                    // ClickHouse also speaks its native protocol, for clickhouse-client.
+                                    Repeater {
+                                        model: win.selected && win.selected.extraPorts ? win.selected.extraPorts : []
+                                        delegate: ConnectionField {
+                                            label: modelData.key === "native" ? qsTr("Native port") : modelData.key
+                                            value: String(modelData.port)
+                                        }
                                     }
 
                                     ConnectionSection {
@@ -705,27 +695,46 @@ ApplicationWindow {
                             }
                         }
 
-                        ColumnLayout {
-                            visible: win.selected === null && backend.loaded && backend.dockerProblem === ""
-                            Layout.fillWidth: true
-                            Layout.topMargin: 160
-                            spacing: 14
-                            Label {
-                                Layout.alignment: Qt.AlignHCenter
-                                text: qsTr("Databases you create show up here,\nwith their usage and how to connect.")
-                                horizontalAlignment: Text.AlignHCenter
-                                color: theme.textDim
-                            }
-                            DepotButton {
-                                Layout.alignment: Qt.AlignHCenter
-                                kind: "primary"
-                                glyph: "󰐕"
-                                text: qsTr("New database")
-                                enabled: backend.dockerProblem === ""
-                                onClicked: win.openCreate()
-                            }
-                        }
                     }
+                }
+
+                ColumnLayout {
+                    visible: win.selected === null && backend.loaded && backend.dockerProblem === ""
+                    anchors.centerIn: parent
+                    width: Math.min(parent.width - 48, 420)
+                    spacing: 10
+
+                    Label {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: "󰆼"
+                        font.pixelSize: 44
+                        color: theme.border
+                    }
+                    Label {
+                        Layout.alignment: Qt.AlignHCenter
+                        Layout.topMargin: 4
+                        text: qsTr("No databases yet")
+                        font.pixelSize: 16
+                        font.weight: Font.DemiBold
+                        color: theme.textBright
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.Wrap
+                        text: qsTr("Databases you create show up here, with their usage and how to connect.")
+                        color: theme.textDim
+                    }
+                    DepotButton {
+                        Layout.alignment: Qt.AlignHCenter
+                        Layout.topMargin: 8
+                        kind: "primary"
+                        glyph: "󰐕"
+                        text: qsTr("New database")
+                        enabled: backend.dockerProblem === ""
+                        onClicked: win.openCreate()
+                    }
+                }
                 }
             }
 

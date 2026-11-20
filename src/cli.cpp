@@ -33,16 +33,17 @@ void usage(QTextStream &stream) {
     stream << "Usage: depot [command]\n\n"
               "  open                         Open the window (the default)\n"
               "  list [--json]                List the databases on this machine\n"
-              "  create <engine> [name] [--port N] [--no-expose] [--json]\n"
-              "                               Create a database with a fresh password and share it\n"
-              "                               on the tailnet. Engines: postgres, mysql, mariadb,\n"
-              "                               redis, mongo, mssql\n"
+              "  create <engine> [name] [--version V] [--port N] [--password P] [--no-expose] [--json]\n"
+              "                               Create a database, with the password \"postgres\" unless\n"
+              "                               one is given, and share it on the tailnet. See\n"
+              "                               `depot versions` for the engines\n"
               "  start <name>                 Start a database\n"
               "  stop <name>                  Stop a database\n"
               "  expose <name>                Share a database on the tailnet\n"
               "  unexpose <name>              Stop sharing it\n"
               "  url <name> [--local]         Print its connection string\n"
               "  remove <name> [--keep-data]  Remove a database, and its data unless kept\n"
+              "  versions                     List the engines and the versions each offers\n"
               "  mcp                          Run the MCP server on stdio, for AI agents\n"
               "  skill install                Install the agent skill for Depot\n";
 }
@@ -64,6 +65,16 @@ int runCli(const QStringList &arguments) {
 
     if (command == "mcp")
         return mcp::serve();
+
+    if (command == "versions") {
+        for (const auto &engine : engines()) {
+            QStringList labels;
+            for (const auto &version : engine.versions)
+                labels << version.label;
+            out << QString("%1\t%2\n").arg(engine.id, labels.join(", "));
+        }
+        return 0;
+    }
 
     if (command == "skill") {
         if (args.value(0) != "install")
@@ -110,7 +121,23 @@ int runCli(const QStringList &arguments) {
                 return fail("pick a port between 1024 and 65535");
             args.remove(portFlag, qMin(2, int(args.size() - portFlag)));
         }
-        const auto created = ops::create(now, args.value(0), args.value(1), port, share);
+        QString password;
+        const int passwordFlag = args.indexOf("--password");
+        if (passwordFlag >= 0) {
+            password = args.value(passwordFlag + 1);
+            if (password.isEmpty())
+                return fail("give the password after --password");
+            args.remove(passwordFlag, qMin(2, int(args.size() - passwordFlag)));
+        }
+        QString version;
+        const int versionFlag = args.indexOf("--version");
+        if (versionFlag >= 0) {
+            version = args.value(versionFlag + 1);
+            if (version.isEmpty())
+                return fail("give the version after --version");
+            args.remove(versionFlag, qMin(2, int(args.size() - versionFlag)));
+        }
+        const auto created = ops::create(now, args.value(0), args.value(1), port, share, password, version);
         if (created.database.name.isEmpty())
             return fail(created.error);
         const auto item = toVariant(created.database, created.shared, now.tailnet);

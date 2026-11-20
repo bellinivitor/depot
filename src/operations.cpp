@@ -34,11 +34,11 @@ QString tailscale() {
     return value.isEmpty() ? "tailscale" : value;
 }
 
-int freePort(const Engine &engine, const ops::Snapshot &now) {
-    for (int port = engine.port; port < 65535; ++port) {
-        bool taken = now.served.contains(port);
+int freePort(int start, const ops::Snapshot &now, const QList<int> &alsoTaken = {}) {
+    for (int port = start; port < 65535; ++port) {
+        bool taken = now.served.contains(port) || alsoTaken.contains(port);
         for (const auto &database : now.databases)
-            taken = taken || database.port == port;
+            taken = taken || database.ports().contains(port);
         QTcpServer probe;
         if (!taken && probe.listen(QHostAddress::LocalHost, port))
             return port;
@@ -75,11 +75,19 @@ Snapshot load() {
     return now;
 }
 
-Created create(const Snapshot &now, const QString &engineId, const QString &name, int port, bool share) {
+Created create(const Snapshot &now, const QString &engineId, const QString &name, int port, bool share,
+               const QString &typedPassword, const QString &version) {
     Created result;
     const Engine *engine = engineById(engineId);
     if (!engine) {
-        result.error = "Unknown engine. Use one of: postgres, mysql, mariadb, redis, mongo, mssql.";
+        result.error = QString("Unknown engine. Use one of: %1.").arg(engineIds().join(", "));
+        return result;
+    }
+    if (!engine->version(version)) {
+        QStringList known;
+        for (const auto &candidate : engine->versions)
+            known << candidate.label;
+        result.error = QString("%1 doesn't offer version %2. Use one of: %3.").arg(engine->label, version, known.join(", "));
         return result;
     }
     const QString finalName = name.isEmpty() ? engine->id : name;
@@ -91,8 +99,12 @@ Created create(const Snapshot &now, const QString &engineId, const QString &name
         result.error = QString("A container named %1 already exists.").arg(finalName);
         return result;
     }
+    if (const QString problem = passwordProblem(engine->id, typedPassword); !problem.isEmpty()) {
+        result.error = problem;
+        return result;
+    }
     if (port == 0)
-        port = freePort(*engine, now);
+        port = freePort(engine->port, now);
     if (port < 1024 || port > 65535) {
         result.error = "Pick a port between 1024 and 65535.";
         return result;
@@ -103,18 +115,26 @@ Created create(const Snapshot &now, const QString &engineId, const QString &name
         return result;
     }
 
-    const QString password = generatePassword();
-    const auto created = run(docker(), createArgs(*engine, finalName, port, password));
+    const QString password = passwordFor(engine->id, typedPassword);
+    // Extra ports take the engine's usual numbers when free, like the main one.
+    QList<int> extras;
+    for (const auto &extra : engine->extraPorts)
+        extras << freePort(extra.port, now, QList<int>{port} + extras);
+    const auto created = run(docker(), createArgs(*engine, finalName, port, password, version, extras));
     if (!created.ok) {
         result.error = created.error();
         return result;
     }
-    result.database = {finalName, engine->id, engine->image, "running", "127.0.0.1", password, port, true};
+    result.database = {finalName, engine->id, engine->image(version), "running", "127.0.0.1", password, port, true};
+    for (int i = 0; i < engine->extraPorts.size(); ++i)
+        result.database.extraPorts.append({engine->extraPorts[i].key, extras[i]});
     if (share) {
-        const auto served = run(tailscale(), serveOnArgs(port));
-        if (!served.ok) {
-            result.error = "Created and running, but sharing it on the tailnet failed: " + served.error();
-            return result;
+        for (const int each : result.database.ports()) {
+            const auto served = run(tailscale(), serveOnArgs(each));
+            if (!served.ok) {
+                result.error = "Created and running, but sharing it on the tailnet failed: " + served.error();
+                return result;
+            }
         }
         result.shared = true;
     }
@@ -141,8 +161,15 @@ QString setShared(const Snapshot &now, const QString &name, bool shared) {
         return {};
     if (shared && !now.tailnet.running)
         return "Tailscale isn't connected. Connect it first (tailscale up).";
-    const auto result = run(tailscale(), shared ? serveOnArgs(database->port) : serveOffArgs(database->port));
-    return result.ok ? QString() : result.error();
+    // Every port goes together: ClickHouse's HTTP and native ports alike.
+    for (const int port : database->ports()) {
+        if (now.served.contains(port) == shared)
+            continue;
+        const auto result = run(tailscale(), shared ? serveOnArgs(port) : serveOffArgs(port));
+        if (!result.ok)
+            return result.error();
+    }
+    return {};
 }
 
 QString remove(const Snapshot &now, const QString &name, bool deleteData) {
@@ -151,8 +178,9 @@ QString remove(const Snapshot &now, const QString &name, bool deleteData) {
         return QString("No database named %1.").arg(name);
     // Stop sharing first, so the tailnet never forwards to a port that a
     // later database might reuse.
-    if (now.shared(*database))
-        run(tailscale(), serveOffArgs(database->port));
+    for (const int port : database->ports())
+        if (now.served.contains(port))
+            run(tailscale(), serveOffArgs(port));
     const auto removed = run(docker(), {"rm", "-f", name});
     if (!removed.ok)
         return removed.error();

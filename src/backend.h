@@ -48,7 +48,9 @@ public:
     QString tailnetIp() const { return m_tailnet.ip; }
 
     Q_INVOKABLE void refresh();
-    Q_INVOKABLE void create(const QString &engine, const QString &name, int port, bool expose);
+    // An empty password means Depot generates one.
+    Q_INVOKABLE void create(const QString &engine, const QString &name, int port, bool expose,
+                            const QString &password = {}, const QString &version = {});
     Q_INVOKABLE void setRunning(const QString &name, bool running);
     Q_INVOKABLE void setExposed(const QString &name, bool exposed);
     Q_INVOKABLE void remove(const QString &name, bool deleteData);
@@ -57,6 +59,11 @@ public:
     Q_INVOKABLE QString suggestName(const QString &engine) const;
     Q_INVOKABLE QString nameProblem(const QString &name) const;
     Q_INVOKABLE QString portProblem(int port) const;
+    // The password a blank field gives, or empty when one is generated.
+    Q_INVOKABLE QString blankPassword(const QString &engine) const { return ::blankPassword(engine); }
+    Q_INVOKABLE QString passwordProblem(const QString &engine, const QString &password) const {
+        return ::passwordProblem(engine, password);
+    }
     Q_INVOKABLE void openDockerSetup();
 
 signals:
@@ -71,6 +78,8 @@ private:
     void docker(const QStringList &args, Done done) { run(m_docker, args, std::move(done)); }
     void tailscale(const QStringList &args, Done done) { run(m_tailscale, args, std::move(done)); }
     void finishRefreshStep();
+    // Turns sharing on or off for each port in turn, stopping at the first failure.
+    void serveAll(QList<int> ports, bool on, Done done);
     void sampleStats();
     void publish();
     void readDockerProblem(const QByteArray &err);
@@ -85,6 +94,7 @@ private:
     QSet<int> m_served;
     Tailnet m_tailnet;
     QHash<QString, QString> m_pending;  // Name to engine, while docker run works
+    QHash<QString, QString> m_pendingImages;
     QSet<QString> m_busy;
     QStringList m_names;
 

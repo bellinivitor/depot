@@ -217,7 +217,7 @@ QVariantList Backend::databases() const {
         const Engine *engine = engineById(it.value());
         list.append(QVariantMap{{"name", it.key()}, {"engine", it.value()},
                                 {"engineLabel", engine ? engine->label : it.value()},
-                                {"image", engine ? engine->image : QString()}, {"state", "creating"},
+                                {"image", m_pendingImages.value(it.key())}, {"state", "creating"},
                                 {"running", false}, {"busy", true}, {"port", 0}, {"exposed", false},
                                 {"managed", true}});
     }
@@ -251,9 +251,14 @@ QVariantMap Backend::totals() const {
 
 QVariantList Backend::engineList() const {
     QVariantList list;
-    for (const auto &engine : engines())
-        list.append(QVariantMap{{"id", engine.id}, {"label", engine.label}, {"image", engine.image},
+    for (const auto &engine : engines()) {
+        QVariantList versions;
+        for (const auto &version : engine.versions)
+            versions.append(version.label);
+        list.append(QVariantMap{{"id", engine.id}, {"label", engine.label}, {"image", engine.image()},
+                                {"versions", versions},
                                 {"port", engine.port}});
+    }
     return list;
 }
 
@@ -264,9 +269,24 @@ const Database *Backend::find(const QString &name) const {
     return nullptr;
 }
 
+void Backend::serveAll(QList<int> ports, bool on, Done done) {
+    if (ports.isEmpty()) {
+        done(true, {}, {});
+        return;
+    }
+    const int port = ports.takeFirst();
+    tailscale(on ? serveOnArgs(port) : serveOffArgs(port),
+              [this, ports, on, done](bool ok, const QByteArray &out, const QByteArray &err) {
+        if (!ok)
+            done(false, out, err);
+        else
+            serveAll(ports, on, done);
+    });
+}
+
 bool Backend::portTaken(int port) const {
     for (const auto &database : m_databases)
-        if (database.port == port)
+        if (database.ports().contains(port))
             return true;
     if (m_served.contains(port))
         return true;
@@ -308,17 +328,29 @@ QString Backend::portProblem(int port) const {
     return {};
 }
 
-void Backend::create(const QString &engineId, const QString &name, int port, bool expose) {
+void Backend::create(const QString &engineId, const QString &name, int port, bool expose, const QString &password,
+                     const QString &version) {
     const Engine *engine = engineById(engineId);
-    if (!engine || !nameProblem(name).isEmpty() || !portProblem(port).isEmpty())
+    if (!engine || !engine->version(version) || !nameProblem(name).isEmpty() || !portProblem(port).isEmpty()
+        || !::passwordProblem(engineId, password).isEmpty())
         return;
 
     m_pending.insert(name, engineId);
     publish();
 
-    docker(createArgs(*engine, name, port, generatePassword()),
-           [this, name, port, expose](bool ok, const QByteArray &, const QByteArray &err) {
+    m_pendingImages.insert(name, engine->image(version));
+    // Extra ports take the engine's usual numbers when free, like the main one.
+    QList<int> extras;
+    for (const auto &extra : engine->extraPorts) {
+        int candidate = extra.port;
+        while (candidate < 65535 && (candidate == port || extras.contains(candidate) || portTaken(candidate)))
+            ++candidate;
+        extras << candidate;
+    }
+    docker(createArgs(*engine, name, port, passwordFor(engineId, password), version, extras),
+           [this, name, port, extras, expose](bool ok, const QByteArray &, const QByteArray &err) {
         m_pending.remove(name);
+        m_pendingImages.remove(name);
         if (!ok) {
             emit notice(tr("Couldn't create %1: %2").arg(name, QString::fromUtf8(err).trimmed()), true);
             refresh();
@@ -329,7 +361,7 @@ void Backend::create(const QString &engineId, const QString &name, int port, boo
             refresh();
             return;
         }
-        tailscale(serveOnArgs(port), [this, name](bool ok, const QByteArray &, const QByteArray &err) {
+        serveAll(QList<int>{port} + extras, true, [this, name](bool ok, const QByteArray &, const QByteArray &err) {
             if (!ok)
                 emit notice(tr("%1 is running, but sharing it on the tailnet failed: %2")
                                 .arg(name, QString::fromUtf8(err).trimmed()), true);
@@ -359,9 +391,11 @@ void Backend::setExposed(const QString &name, bool exposed) {
         return;
     m_busy.insert(name);
     publish();
-    const int port = database->port;
-    tailscale(exposed ? serveOnArgs(port) : serveOffArgs(port),
-              [this, name](bool ok, const QByteArray &, const QByteArray &err) {
+    QList<int> ports;
+    for (const int port : database->ports())
+        if (m_served.contains(port) != exposed)
+            ports << port;
+    serveAll(ports, exposed, [this, name](bool ok, const QByteArray &, const QByteArray &err) {
         m_busy.remove(name);
         if (!ok) {
             QString text = QString::fromUtf8(err).trimmed();
@@ -380,7 +414,10 @@ void Backend::remove(const QString &name, bool deleteData) {
     m_busy.insert(name);
     publish();
 
-    const int port = m_served.contains(database->port) ? database->port : 0;
+    QList<int> served;
+    for (const int port : database->ports())
+        if (m_served.contains(port))
+            served << port;
     const bool managed = database->managed;
     auto removeContainer = [this, name, deleteData, managed] {
         docker({"rm", "-f", name}, [this, name, deleteData, managed](bool ok, const QByteArray &, const QByteArray &err) {
@@ -401,10 +438,7 @@ void Backend::remove(const QString &name, bool deleteData) {
     };
     // Stop sharing first, so the tailnet never forwards to a port that a
     // later database might reuse.
-    if (port > 0)
-        tailscale(serveOffArgs(port), [removeContainer](bool, const QByteArray &, const QByteArray &) { removeContainer(); });
-    else
-        removeContainer();
+    serveAll(served, false, [removeContainer](bool, const QByteArray &, const QByteArray &) { removeContainer(); });
 }
 
 void Backend::copy(const QString &text) {

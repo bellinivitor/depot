@@ -6,9 +6,12 @@ way [Omarchy](https://omarchy.org)'s own apps are.
 
 ![Depot](screenshot.png)
 
-Pick PostgreSQL, MySQL, MariaDB, Redis, MongoDB, or SQL Server, give it a
-name, and Depot starts it with a generated password and its data in a Docker
-volume. The port listens on `127.0.0.1` only; flip **Tailnet** and Depot runs
+Pick PostgreSQL (13–18), MySQL (8.0, 8.4, 9), MariaDB (10.6–12), Redis (6.2,
+7, 8), MongoDB (6.0–8.2), SQL Server (2017–2025), or ClickHouse (24.8–25.10, with
+both its HTTP and native ports), give it a name, and Depot
+starts it with its data in a Docker volume. The password is `postgres` unless
+you type another; SQL Server, which refuses simple passwords, gets a generated
+one. The port listens on `127.0.0.1` only; flip **Tailnet** and Depot runs
 `tailscale serve --tcp` so your laptop, and nothing on the local network,
 reaches it at `your-machine:5432`. The connection details sit at the bottom of
 the window, one click from the clipboard: always for this machine, for the
@@ -75,7 +78,9 @@ command exits 0 or 1 with errors on stderr; `list` and `create` take `--json`.
 ```sh
 depot list --json
 depot create postgres app            # prints the tailnet connection string
-depot create mysql shop --port 3307 --no-expose
+depot create mysql shop --version 9 --port 3307 --no-expose
+depot create postgres api --password "s3cret-pass"
+depot versions                       # the versions each engine offers
 depot url app --local
 depot start app | depot stop app
 depot expose app | depot unexpose app
@@ -105,7 +110,7 @@ Or, in any client that takes a JSON config:
 | `list_databases` | Every database container, its state, port, and sharing; no passwords |
 | `get_connection` | Host, port, user, password, and URL, from this machine or the tailnet |
 | `get_usage` | CPU, memory, network, and disk right now |
-| `create_database` | A new database with a generated password; shared only when asked |
+| `create_database` | A new database, any offered version; shared only when asked |
 | `start_database` / `stop_database` | Start or stop one |
 | `share_database` | Share it on the tailnet, or stop |
 | `remove_database` | Remove it; the data stays unless `delete_data` is set |
