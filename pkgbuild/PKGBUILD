@@ -1,5 +1,5 @@
 pkgname=depot
-pkgver=0.1.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='Create local databases in Docker and share them on your tailnet'
 arch=('x86_64' 'aarch64')

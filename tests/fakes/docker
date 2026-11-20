@@ -45,6 +45,20 @@ elif args[:2] == ["rm", "-f"]:
     c = find(args[2]) or sys.exit(f"No such container: {args[2]}")
     containers.remove(c)
     save()
+elif args[:1] == ["stats"]:
+    # Steady numbers that wander a little, so sparklines have a shape.
+    import math, time, zlib
+    t = time.time()
+    for name in args[4:]:
+        c = find(name)
+        if not c or c["State"]["Status"] != "running":
+            continue
+        seed = zlib.crc32(name.encode()) % 100
+        cpu = 0.4 + seed / 40 + 1.2 * (1 + math.sin(t / 7 + seed))
+        mem = 40 + seed * 3 + 6 * math.sin(t / 11 + seed)
+        print(json.dumps({"Name": name, "CPUPerc": f"{cpu:.2f}%", "MemUsage": f"{mem:.1f}MiB / 31.11GiB",
+                          "MemPerc": "0.20%", "NetIO": f"{seed * 37 + 4}kB / {seed * 11 + 2}kB",
+                          "BlockIO": f"{seed / 3 + 18:.1f}MB / {seed / 7 + 1:.1f}MB", "PIDs": str(6 + seed % 30)}))
 elif args[:2] == ["volume", "rm"]:
     open(os.path.join(os.environ["FAKE_STATE"], "removed-volumes"), "a").write(args[2] + "\n")
 else:

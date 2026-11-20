@@ -11,7 +11,16 @@ name, and Depot starts it with a generated password and its data in a Docker
 volume. The port listens on `127.0.0.1` only; flip **Tailnet** and Depot runs
 `tailscale serve --tcp` so your laptop, and nothing on the local network,
 reaches it at `your-machine:5432`. The connection details sit at the bottom of
-the window, one click from the clipboard.
+the window, one click from the clipboard: always for this machine, for the
+projects running here, and for the tailnet too while it is shared.
+
+Each database shows what it costs the machine as it runs: CPU and memory
+with the last two minutes drawn as a line, plus network and disk traffic, from
+`docker stats`. The header adds them up across everything running.
+
+The window wears the current Omarchy theme, background, surfaces, text and
+accent, light or dark, and switches with it live, in the same monospace font
+as the rest of the desktop.
 
 Databases made by Omarchy's *Install > Development > Docker DB* show up too,
 with a warning before you share one that has no password.
@@ -42,13 +51,18 @@ Two one-time permissions:
 
 | Key | Action |
 | --- | --- |
+| `Tab` / `Shift+Tab` | Move between the list and every button |
+| `↑` `↓` / `J` `K` | Select a database |
+| `1`–`9` | Jump to a database |
+| `Enter` | From the list, go to its buttons |
 | `N` | New database |
-| `↑` `↓` / `J` `K` | Select |
 | `Space` | Start or stop |
 | `T` | Share on the tailnet, or stop sharing |
-| `C` | Copy the connection string |
+| `C` | Copy the connection string (the tailnet one while shared) |
+| `L` | Copy the connection string for this machine |
+| `Y` | Copy the password |
 | `P` | Show or hide the password |
-| `Delete` | Remove (asks first, and keeps the data unless you say otherwise) |
+| `D` / `Delete` | Remove (asks first, and keeps the data unless you say otherwise) |
 | `R` | Refresh |
 | `?` | Show shortcuts |
 | `Q` | Quit |
@@ -68,6 +82,37 @@ depot expose app | depot unexpose app
 depot remove app --keep-data
 depot skill install                  # teaches Claude Code to drive Depot
 ```
+
+## For AI agents (MCP)
+
+`depot mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server on stdio, so Claude Code, Codex, OpenCode, and other agents can manage
+the databases themselves. Register it once:
+
+```sh
+claude mcp add --scope user depot -- depot mcp     # Claude Code
+codex mcp add depot -- depot mcp                   # Codex
+```
+
+Or, in any client that takes a JSON config:
+
+```json
+{ "mcpServers": { "depot": { "command": "depot", "args": ["mcp"] } } }
+```
+
+| Tool | What it does |
+| --- | --- |
+| `list_databases` | Every database container, its state, port, and sharing; no passwords |
+| `get_connection` | Host, port, user, password, and URL, from this machine or the tailnet |
+| `get_usage` | CPU, memory, network, and disk right now |
+| `create_database` | A new database with a generated password; shared only when asked |
+| `start_database` / `stop_database` | Start or stop one |
+| `share_database` | Share it on the tailnet, or stop |
+| `remove_database` | Remove it; the data stays unless `delete_data` is set |
+
+The defaults lean safe for an agent: nothing is shared on the tailnet unless
+asked, removal keeps the data volume, and tools are annotated so clients can
+ask before the destructive one.
 
 ## Development
 

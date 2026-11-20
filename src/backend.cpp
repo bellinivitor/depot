@@ -3,6 +3,7 @@
 #include <QClipboard>
 #include <QGuiApplication>
 #include <QHostAddress>
+#include <QLocale>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QTcpServer>
@@ -21,8 +22,13 @@ Backend::Backend(const QString &docker, const QString &tailscale, QObject *paren
     // Containers and serve config also change from the terminal, so keep
     // looking rather than trusting only what this window did.
     connect(&m_timer, &QTimer::timeout, this, &Backend::refresh);
+    // Stats sample back to back: `docker stats --no-stream` itself takes a
+    // second to measure, so a fixed timer would pile calls up.
+    m_statsTimer.setSingleShot(true);
+    connect(&m_statsTimer, &QTimer::timeout, this, &Backend::sampleStats);
     if (refreshInterval > 0) {
         m_timer.start(refreshInterval);
+        m_statsTimer.setInterval(qMin(refreshInterval, 1000));
         refresh();
     }
 }
@@ -109,6 +115,52 @@ void Backend::refresh() {
     });
 }
 
+void Backend::publish() {
+    QStringList names;
+    for (const auto &item : databases())
+        names.append(item.toMap().value("name").toString());
+    if (names != m_names) {
+        m_names = names;
+        emit namesChanged();
+    }
+    emit changed();
+}
+
+void Backend::sampleStats() {
+    QStringList running;
+    for (const auto &database : m_databases)
+        if (database.running())
+            running.append(database.name);
+    if (m_sampling)
+        return;
+    if (running.isEmpty()) {
+        m_stats.clear();
+        if (m_statsTimer.interval() > 0)
+            m_statsTimer.start();
+        return;
+    }
+    m_sampling = true;
+    docker(QStringList{"stats", "--no-stream", "--format", "{{json .}}"} + running,
+           [this](bool, const QByteArray &out, const QByteArray &) {
+        m_sampling = false;
+        // A container that stopped between samples simply drops out.
+        m_stats = parseStats(out);
+        for (auto it = m_stats.begin(); it != m_stats.end(); ++it) {
+            auto &cpu = m_cpuHistory[it.key()];
+            auto &memory = m_memoryHistory[it.key()];
+            cpu.append(it->cpu);
+            memory.append(it->memory);
+            while (cpu.size() > historyLength)
+                cpu.removeFirst();
+            while (memory.size() > historyLength)
+                memory.removeFirst();
+        }
+        publish();
+        if (m_statsTimer.interval() > 0)
+            m_statsTimer.start();
+    });
+}
+
 void Backend::finishRefreshStep() {
     if (--m_refreshSteps > 0)
         return;
@@ -118,8 +170,11 @@ void Backend::finishRefreshStep() {
     m_served = m_nextServed;
     m_tailnet = m_nextTailnet;
     m_tailscaleProblem = m_nextTailscaleProblem;
+    const bool first = !m_loaded;
     m_loaded = true;
-    emit changed();
+    publish();
+    if (first && m_statsTimer.interval() > 0)
+        sampleStats();
 }
 
 QVariantList Backend::databases() const {
@@ -127,6 +182,31 @@ QVariantList Backend::databases() const {
     for (const auto &database : m_databases) {
         auto item = toVariant(database, database.port > 0 && m_served.contains(database.port), m_tailnet);
         item["busy"] = m_busy.contains(database.name);
+        if (database.running() && m_stats.contains(database.name)) {
+            const Stats &stats = m_stats[database.name];
+            const QLocale locale;
+            auto size = [&](double bytes) { return locale.formattedDataSize(qint64(bytes), 1, QLocale::DataSizeIecFormat); };
+            QVariantList cpu, memory;
+            for (double value : m_cpuHistory.value(database.name))
+                cpu.append(value);
+            for (double value : m_memoryHistory.value(database.name))
+                memory.append(value);
+            item["stats"] = QVariantMap{
+                {"cpu", stats.cpu},
+                {"cpuText", locale.toString(stats.cpu, 'f', stats.cpu < 10 ? 1 : 0) + "%"},
+                {"memory", stats.memory},
+                {"memoryText", size(stats.memory)},
+                {"memoryLimitText", size(stats.memoryLimit)},
+                {"memoryShare", stats.memoryLimit > 0 ? stats.memory / stats.memoryLimit : 0.0},
+                {"netInText", size(stats.netIn)},
+                {"netOutText", size(stats.netOut)},
+                {"diskReadText", size(stats.diskRead)},
+                {"diskWriteText", size(stats.diskWrite)},
+                {"processes", stats.processes},
+                {"cpuHistory", cpu},
+                {"memoryHistory", memory},
+            };
+        }
         list.append(item);
     }
     // Databases still downloading or starting show up right away, so the
@@ -145,6 +225,28 @@ QVariantList Backend::databases() const {
         return a.toMap().value("name").toString() < b.toMap().value("name").toString();
     });
     return list;
+}
+
+QVariantMap Backend::totals() const {
+    int running = 0, shared = 0;
+    double cpu = 0, memory = 0;
+    for (const auto &database : m_databases) {
+        running += database.running();
+        shared += database.port > 0 && m_served.contains(database.port);
+        if (database.running() && m_stats.contains(database.name)) {
+            cpu += m_stats[database.name].cpu;
+            memory += m_stats[database.name].memory;
+        }
+    }
+    const QLocale locale;
+    return {
+        {"count", m_databases.size()},
+        {"running", running},
+        {"shared", shared},
+        {"sampled", !m_stats.isEmpty()},
+        {"cpuText", locale.toString(cpu, 'f', cpu < 10 ? 1 : 0) + "%"},
+        {"memoryText", locale.formattedDataSize(qint64(memory), 1, QLocale::DataSizeIecFormat)},
+    };
 }
 
 QVariantList Backend::engineList() const {
@@ -212,7 +314,7 @@ void Backend::create(const QString &engineId, const QString &name, int port, boo
         return;
 
     m_pending.insert(name, engineId);
-    emit changed();
+    publish();
 
     docker(createArgs(*engine, name, port, generatePassword()),
            [this, name, port, expose](bool ok, const QByteArray &, const QByteArray &err) {
@@ -241,7 +343,7 @@ void Backend::setRunning(const QString &name, bool running) {
     if (!database || m_busy.contains(name) || database->running() == running)
         return;
     m_busy.insert(name);
-    emit changed();
+    publish();
     docker({running ? "start" : "stop", name}, [this, name](bool ok, const QByteArray &, const QByteArray &err) {
         m_busy.remove(name);
         if (!ok)
@@ -256,7 +358,7 @@ void Backend::setExposed(const QString &name, bool exposed) {
         || m_served.contains(database->port) == exposed)
         return;
     m_busy.insert(name);
-    emit changed();
+    publish();
     const int port = database->port;
     tailscale(exposed ? serveOnArgs(port) : serveOffArgs(port),
               [this, name](bool ok, const QByteArray &, const QByteArray &err) {
@@ -276,7 +378,7 @@ void Backend::remove(const QString &name, bool deleteData) {
     if (!database || m_busy.contains(name))
         return;
     m_busy.insert(name);
-    emit changed();
+    publish();
 
     const int port = m_served.contains(database->port) ? database->port : 0;
     const bool managed = database->managed;

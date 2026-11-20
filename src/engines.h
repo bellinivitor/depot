@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QHash>
 #include <QList>
 #include <QSet>
 #include <QString>
@@ -32,12 +33,31 @@ struct Database {
     bool running() const { return state == "running"; }
 };
 
+// One sample of `docker stats` for a container. Sizes are in bytes.
+struct Stats {
+    double cpu = 0;        // Percent of one core; above 100 when it uses several
+    double memory = 0;
+    double memoryLimit = 0;
+    double netIn = 0;
+    double netOut = 0;
+    double diskRead = 0;
+    double diskWrite = 0;
+    int processes = 0;
+};
+
 const QList<Engine> &engines();
 const Engine *engineById(const QString &id);
 const Engine *engineForImage(const QString &image);
 
 // Parses `docker inspect` output, keeping only database containers.
 QList<Database> parseInspect(const QByteArray &json);
+
+// Parses `docker stats --no-stream --format '{{json .}}'`, one object per line,
+// by container name.
+QHash<QString, Stats> parseStats(const QByteArray &jsonLines);
+
+// "9.355MiB", "19.2MB", "126B" to bytes; Docker mixes binary and decimal units.
+double parseSize(const QString &text);
 
 // The TCP ports `tailscale serve status --json` forwards.
 QSet<int> parseServedPorts(const QByteArray &json);

@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QFontDatabase>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
@@ -62,15 +63,72 @@ void Theme::refreshRounding() {
 }
 
 QString Theme::readAccent(const QString &path) {
+    return readColors(path).value("accent");
+}
+
+QHash<QString, QString> Theme::readColors(const QString &path) {
+    QHash<QString, QString> colors;
     QFile file(path);
     if (file.open(QIODevice::ReadOnly)) {
-        const QRegularExpression expression(R"re(^\s*accent\s*=\s*["'](#[0-9a-fA-F]{6})["'])re",
+        const QRegularExpression expression(R"re(^\s*([a-z_]+)\s*=\s*["']([^"']*)["'])re",
                                             QRegularExpression::MultilineOption);
-        const auto match = expression.match(QString::fromUtf8(file.readAll()));
-        if (match.hasMatch())
-            return match.captured(1);
+        auto matches = expression.globalMatch(QString::fromUtf8(file.readAll()));
+        while (matches.hasNext()) {
+            const auto match = matches.next();
+            const QString value = match.captured(2);
+            if (match.captured(1) == "mode" || QRegularExpression("^#[0-9a-fA-F]{6}$").match(value).hasMatch())
+                colors.insert(match.captured(1), value);
+        }
     }
-    return "#FFD60A";
+
+    // Without Omarchy: a neutral graphite, warm enough not to read as black.
+    if (!colors.contains("accent"))
+        colors.insert("accent", "#FFD60A");
+    const bool light = colors.value("mode") == "light";
+    if (!colors.contains("background"))
+        colors.insert("background", light ? "#f4f4f5" : "#1e1f24");
+    if (!colors.contains("foreground"))
+        colors.insert("foreground", light ? "#27272a" : "#c9cbd3");
+
+    // Missing shades are mixed from the two anchors, so they stay in the
+    // theme's own hue.
+    const QColor background(colors.value("background")), foreground(colors.value("foreground"));
+    auto mix = [&](double amount) {
+        return QColor::fromRgbF(background.redF() + (foreground.redF() - background.redF()) * amount,
+                                background.greenF() + (foreground.greenF() - background.greenF()) * amount,
+                                background.blueF() + (foreground.blueF() - background.blueF()) * amount)
+            .name();
+    };
+    const QList<QPair<QString, QString>> derived{
+        {"dark_background", background.darker(light ? 104 : 118).name()},
+        {"lighter_background", mix(0.06)},
+        {"selection", mix(0.12)},
+        {"muted", mix(0.25)},
+        {"dark_foreground", mix(0.5)},
+        {"bright_foreground", light ? foreground.darker(130).name() : foreground.lighter(115).name()},
+    };
+    for (const auto &[key, value] : derived)
+        if (!colors.contains(key))
+            colors.insert(key, value);
+
+    const QList<QPair<QString, QString>> hues{
+        {"red", "#f87171"}, {"yellow", "#fbbf24"}, {"green", "#4ade80"}, {"blue", "#60a5fa"},
+        {"cyan", "#22d3ee"}, {"magenta", "#c084fc"}, {"orange", "#fb923c"},
+    };
+    for (const auto &[key, value] : hues)
+        if (!colors.contains(key))
+            colors.insert(key, value);
+    return colors;
+}
+
+QString Theme::font() const {
+    return QFontDatabase::systemFont(QFontDatabase::FixedFont).family();
+}
+
+QString Theme::tint(const QString &color, double alpha) const {
+    QColor c(color);
+    c.setAlphaF(qBound(0.0, alpha, 1.0));
+    return c.name(QColor::HexArgb);
 }
 
 // Black or white, whichever reads on the accent (WCAG relative luminance).
@@ -100,9 +158,10 @@ void Theme::reload() {
         if (QFileInfo::exists(path))
             m_watcher.addPath(path);
 
-    const auto accent = readAccent(m_directory + "/theme/colors.toml");
-    if (accent != m_accent) {
-        m_accent = accent;
+    const auto colors = readColors(m_directory + "/theme/colors.toml");
+    if (colors != m_colors) {
+        m_colors = colors;
+        m_accent = colors.value("accent");
         emit changed();
     }
 }

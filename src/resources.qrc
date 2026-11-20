@@ -1,11 +1,17 @@
 <RCC>
     <qresource prefix="/">
         <file alias="Main.qml">Main.qml</file>
-        <file alias="AccentButton.qml">AccentButton.qml</file>
-        <file alias="DatabaseRow.qml">DatabaseRow.qml</file>
+        <file alias="DepotButton.qml">DepotButton.qml</file>
+        <file alias="EngineBadge.qml">EngineBadge.qml</file>
+        <file alias="DatabaseItem.qml">DatabaseItem.qml</file>
+        <file alias="StatTile.qml">StatTile.qml</file>
+        <file alias="Sparkline.qml">Sparkline.qml</file>
+        <file alias="ConnectionField.qml">ConnectionField.qml</file>
+        <file alias="ConnectionSection.qml">ConnectionSection.qml</file>
         <file alias="CreateDialog.qml">CreateDialog.qml</file>
         <file alias="RemoveDialog.qml">RemoveDialog.qml</file>
         <file alias="HelpOverlay.qml">HelpOverlay.qml</file>
+        <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="i18n/pt-BR.json">i18n/pt-BR.json</file>
         <file alias="skill/SKILL.md">skill/SKILL.md</file>
     </qresource>

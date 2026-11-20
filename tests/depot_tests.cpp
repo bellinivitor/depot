@@ -1,3 +1,4 @@
+#include <QColor>
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
@@ -9,6 +10,7 @@
 
 #include "backend.h"
 #include "engines.h"
+#include "mcp.h"
 #include "theme.h"
 #include "translator.h"
 
@@ -107,6 +109,29 @@ private slots:
         QCOMPARE(connectionUrl(mssql, "box"), QString("Server=box,1433;User Id=sa;Password=@dmin123;TrustServerCertificate=True"));
     }
 
+    void parsesStats()
+    {
+        QCOMPARE(parseSize("126B"), 126.0);
+        QCOMPARE(parseSize("1.56kB"), 1560.0);
+        QCOMPARE(parseSize("9.5MiB"), 9.5 * 1024 * 1024);
+        QCOMPARE(parseSize("2GiB"), 2.0 * 1024 * 1024 * 1024);
+        QCOMPARE(parseSize("garbage"), 0.0);
+
+        const auto stats = parseStats(
+            R"({"BlockIO":"19.2MB / 0B","CPUPerc":"112.50%","MemUsage":"9.5MiB / 2GiB","Name":"cache","NetIO":"1.56kB / 126B","PIDs":"6"})"
+            "\n\n");
+        QCOMPARE(stats.size(), 1);
+        const Stats cache = stats.value("cache");
+        QCOMPARE(cache.cpu, 112.5);
+        QCOMPARE(cache.memory, 9.5 * 1024 * 1024);
+        QCOMPARE(cache.memoryLimit, 2.0 * 1024 * 1024 * 1024);
+        QCOMPARE(cache.netIn, 1560.0);
+        QCOMPARE(cache.netOut, 126.0);
+        QCOMPARE(cache.diskRead, 19200000.0);
+        QCOMPARE(cache.diskWrite, 0.0);
+        QCOMPARE(cache.processes, 6);
+    }
+
     void generatesStrongPasswords()
     {
         const QRegularExpression shape("^[A-Za-z0-9]{20}$");
@@ -181,6 +206,105 @@ private slots:
         QCOMPARE(QJsonDocument::fromJson(serve.readAll()).object().size(), 0);
     }
 
+    void backendSamplesUsage()
+    {
+        QTemporaryDir state;
+        qputenv("FAKE_STATE", state.path().toUtf8());
+        Backend backend(FAKES "/docker", FAKES "/tailscale", nullptr, 200);
+        backend.create("redis", "cache", backend.suggestPort("redis"), false);
+        QTRY_VERIFY(backend.databases().size() == 1 && backend.names() == QStringList{"cache"});
+
+        // A few samples build up a history, and the totals add them up.
+        QTRY_VERIFY_WITH_TIMEOUT(backend.databases().value(0).toMap().value("stats").toMap()
+                                     .value("cpuHistory").toList().size() >= 3, 15000);
+        const auto stats = backend.databases().value(0).toMap().value("stats").toMap();
+        QVERIFY(stats.value("memory").toDouble() > 0);
+        QVERIFY(stats.value("memoryText").toString().contains("MiB"));
+        QVERIFY(stats.value("processes").toInt() > 0);
+        QCOMPARE(backend.totals().value("running").toInt(), 1);
+        QVERIFY(backend.totals().value("sampled").toBool());
+
+        // A stopped database has no stats.
+        backend.setRunning("cache", false);
+        QTRY_VERIFY(!backend.databases().value(0).toMap().contains("stats"));
+        QCOMPARE(backend.totals().value("running").toInt(), 0);
+    }
+
+    void mcpNegotiatesAndListsTools()
+    {
+        const auto init = mcp::handle(QJsonDocument::fromJson(
+            R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{}}})").object()).toObject();
+        QCOMPARE(init.value("id").toInt(), 1);
+        QCOMPARE(init.value("result").toObject().value("protocolVersion").toString(), QString("2025-03-26"));
+        QVERIFY(init.value("result").toObject().value("capabilities").toObject().contains("tools"));
+
+        // An unknown version gets the newest this server speaks.
+        const auto future = mcp::handle(QJsonDocument::fromJson(
+            R"({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2099-01-01"}})").object()).toObject();
+        QCOMPARE(future.value("result").toObject().value("protocolVersion").toString(), mcp::supportedVersions().first());
+
+        // Notifications get no reply.
+        QVERIFY(mcp::handle(QJsonDocument::fromJson(R"({"jsonrpc":"2.0","method":"notifications/initialized"})").object()).isNull());
+
+        const auto tools = mcp::tools();
+        QCOMPARE(tools.size(), 8);
+        for (const auto &value : tools) {
+            const auto tool = value.toObject();
+            QVERIFY(!tool.value("description").toString().isEmpty());
+            QCOMPARE(tool.value("inputSchema").toObject().value("type").toString(), QString("object"));
+            const auto hints = tool.value("annotations").toObject();
+            // Only removal destroys anything, and every reader says so.
+            QCOMPARE(hints.value("destructiveHint").toBool(), tool.value("name").toString() == "remove_database");
+            if (tool.value("name").toString().startsWith("list") || tool.value("name").toString().startsWith("get"))
+                QVERIFY(hints.value("readOnlyHint").toBool());
+        }
+
+        const auto unknown = mcp::handle(QJsonDocument::fromJson(R"({"jsonrpc":"2.0","id":3,"method":"nope"})").object()).toObject();
+        QCOMPARE(unknown.value("error").toObject().value("code").toInt(), -32601);
+    }
+
+    void mcpManagesDatabases()
+    {
+        QTemporaryDir state;
+        qputenv("FAKE_STATE", state.path().toUtf8());
+        qputenv("DEPOT_DOCKER", FAKES "/docker");
+        qputenv("DEPOT_TAILSCALE", FAKES "/tailscale");
+        auto call = [](const QString &tool, const QJsonObject &args) {
+            return mcp::handle({{"jsonrpc", "2.0"}, {"id", 9}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", tool}, {"arguments", args}}}})
+                .toObject().value("result").toObject();
+        };
+
+        // Created without sharing unless asked.
+        auto created = call("create_database", {{"engine", "redis"}, {"name", "cache"}});
+        QVERIFY(!created.value("isError").toBool());
+        const auto content = created.value("structuredContent").toObject();
+        QVERIFY(!content.value("database").toObject().value("shared_on_tailnet").toBool());
+        QCOMPARE(content.value("connection").toObject().value("password").toString().size(), 20);
+
+        // The listing never carries passwords.
+        auto listed = call("list_databases", {});
+        QVERIFY(!QJsonDocument(listed).toJson().contains(content.value("connection").toObject().value("password").toString().toUtf8()));
+        QCOMPARE(listed.value("structuredContent").toObject().value("databases").toArray().size(), 1);
+
+        QVERIFY(call("get_connection", {{"name", "cache"}, {"from", "tailnet"}}).value("isError").toBool());
+        QVERIFY(!call("share_database", {{"name", "cache"}, {"shared", true}}).value("isError").toBool());
+        QCOMPARE(call("get_connection", {{"name", "cache"}}).value("structuredContent").toObject().value("host").toString(),
+                 QString("workstation.tail1234.ts.net"));
+
+        QVERIFY(call("stop_database", {{"name", "missing"}}).value("isError").toBool());
+        QVERIFY(!call("stop_database", {{"name", "cache"}}).value("isError").toBool());
+        QCOMPARE(call("get_usage", {{"name", "cache"}}).value("structuredContent").toObject().value("running").toBool(), false);
+
+        // Removing keeps the data unless asked.
+        QVERIFY(!call("remove_database", {{"name", "cache"}}).value("isError").toBool());
+        QVERIFY(!QFile::exists(state.path() + "/removed-volumes"));
+        QCOMPARE(call("list_databases", {}).value("structuredContent").toObject().value("databases").toArray().size(), 0);
+
+        qunsetenv("DEPOT_DOCKER");
+        qunsetenv("DEPOT_TAILSCALE");
+    }
+
     void backendReportsDockerPermission()
     {
         QTemporaryDir state;
@@ -223,6 +347,28 @@ private slots:
         Theme theme(dir.path());
         QCOMPARE(theme.accent(), QString("#112233"));
         QCOMPARE(theme.accentForeground(), QString("white"));
+    }
+
+    void themeReadsThePalette()
+    {
+        QTemporaryDir dir;
+        QDir(dir.path()).mkpath("theme");
+        write(dir.path() + "/theme/colors.toml",
+              "mode = \"dark\"\naccent = \"#7aa2f7\"\nbackground = \"#1a1b26\"\nlighter_background = \"#24283b\"\n");
+        Theme theme(dir.path());
+        QVERIFY(theme.dark());
+        QCOMPARE(theme.accent(), QString("#7aa2f7"));
+        QCOMPARE(theme.background(), QString("#1a1b26"));
+        QCOMPARE(theme.surface(), QString("#24283b"));
+        // Keys the theme leaves out are filled in, never empty.
+        QVERIFY(QColor(theme.selection()).isValid());
+        QVERIFY(QColor(theme.textDim()).isValid());
+        QVERIFY(QColor(theme.green()).isValid());
+        QCOMPARE(theme.tint("#ff0000", 0.5), QString("#80ff0000"));
+
+        write(dir.path() + "/theme/colors.toml", "mode = \"light\"\nbackground = \"#eff1f5\"\n");
+        QTRY_VERIFY(!theme.dark());
+        QCOMPARE(theme.background(), QString("#eff1f5"));
     }
 
     void themeFollowsHyprlandRounding()

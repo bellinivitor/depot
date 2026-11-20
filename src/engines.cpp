@@ -7,6 +7,8 @@
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QUrl>
+#include <cmath>
+#include <tuple>
 
 const QList<Engine> &engines() {
     // Images and defaults match omarchy-install-docker-dbs, so databases made
@@ -83,6 +85,41 @@ QList<Database> parseInspect(const QByteArray &json) {
         result.append(database);
     }
     std::sort(result.begin(), result.end(), [](const Database &a, const Database &b) { return a.name < b.name; });
+    return result;
+}
+
+double parseSize(const QString &text) {
+    static const QRegularExpression shape(R"(^\s*([0-9.]+)\s*([kKMGTP]?i?B)\s*$)");
+    const auto match = shape.match(text);
+    if (!match.hasMatch())
+        return 0;
+    const QString unit = match.captured(2);
+    const bool binary = unit.contains('i');
+    const double base = binary ? 1024 : 1000;
+    const int power = QString("BKMGTP").indexOf(unit.at(0).toUpper());
+    return match.captured(1).toDouble() * std::pow(base, qMax(0, power));
+}
+
+QHash<QString, Stats> parseStats(const QByteArray &jsonLines) {
+    QHash<QString, Stats> result;
+    for (const auto &line : jsonLines.split('\n')) {
+        const auto object = QJsonDocument::fromJson(line).object();
+        const QString name = object.value("Name").toString();
+        if (name.isEmpty())
+            continue;
+        auto pair = [&](const char *key) {
+            const auto parts = object.value(key).toString().split('/');
+            return std::pair{parseSize(parts.value(0)), parseSize(parts.value(1))};
+        };
+        Stats stats;
+        QString cpu = object.value("CPUPerc").toString();
+        stats.cpu = cpu.remove('%').toDouble();
+        std::tie(stats.memory, stats.memoryLimit) = pair("MemUsage");
+        std::tie(stats.netIn, stats.netOut) = pair("NetIO");
+        std::tie(stats.diskRead, stats.diskWrite) = pair("BlockIO");
+        stats.processes = object.value("PIDs").toString().toInt();
+        result.insert(name, stats);
+    }
     return result;
 }
 

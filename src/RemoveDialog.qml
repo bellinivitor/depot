@@ -10,8 +10,11 @@ Dialog {
     anchors.centerIn: Overlay.overlay
     width: Math.min(480, Overlay.overlay ? Overlay.overlay.width - 48 : 480)
     padding: 24
+    topPadding: 8
+    font.family: theme.font
     Material.roundedScale: theme.radius
-    Material.background: "#18181b"
+    Material.background: theme.surface
+    Material.accent: theme.red
 
     property var db: null
 
@@ -21,6 +24,9 @@ Dialog {
         open()
     }
 
+    // Focus starts on Cancel, so a stray Enter never removes anything.
+    onOpened: cancelButton.forceActiveFocus(Qt.TabFocusReason)
+
     function confirm() {
         backend.remove(db.name, dataBox.checked)
         close()
@@ -28,7 +34,7 @@ Dialog {
 
     title: db ? qsTr("Remove %1?").arg(db.name) : ""
 
-    Shortcut { sequences: ["Return", "Enter"]; enabled: dialog.visible; onActivated: dialog.confirm() }
+    Shortcut { sequence: "D"; enabled: dialog.visible && dataBox.visible; onActivated: dataBox.checked = !dataBox.checked }
 
     ColumnLayout {
         anchors.fill: parent
@@ -37,7 +43,7 @@ Dialog {
         Label {
             Layout.fillWidth: true
             wrapMode: Text.Wrap
-            color: "#d4d4d8"
+            color: theme.text
             text: qsTr("The container stops and goes away, and the tailnet stops reaching it.")
         }
 
@@ -45,32 +51,39 @@ Dialog {
             id: dataBox
             visible: dialog.db !== null && dialog.db.managed === true
             text: qsTr("Also delete its data")
-            Material.accent: "#f87171"
+            font.family: theme.font
+            Material.accent: theme.red
         }
 
         Label {
             visible: dataBox.checked
             Layout.fillWidth: true
             wrapMode: Text.Wrap
-            font.pixelSize: 13
-            color: "#f87171"
+            font.pixelSize: 12
+            color: theme.red
             text: qsTr("Every table and row in it is gone for good.")
         }
 
         RowLayout {
             Layout.fillWidth: true
-            Item { Layout.fillWidth: true }
-            Button {
-                Material.roundedScale: theme.radius
+            Layout.topMargin: 4
+            spacing: 10
+            Label {
+                Layout.fillWidth: true
+                text: qsTr("Tab next · Esc cancel")
+                font.pixelSize: 11
+                color: theme.textDim
+            }
+            DepotButton {
+                id: cancelButton
+                kind: "quiet"
                 text: qsTr("Cancel")
-                flat: true
                 onClicked: dialog.close()
             }
-            Button {
-                Material.roundedScale: theme.radius
+            DepotButton {
+                kind: "danger"
+                glyph: "󰩺"
                 text: qsTr("Remove")
-                highlighted: true
-                Material.accent: "#dc2626"
                 onClicked: dialog.confirm()
             }
         }

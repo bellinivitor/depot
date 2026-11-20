@@ -28,6 +28,9 @@ depot remove app --keep-data         # keeps the depot-app volume
 
 Engines: postgres, mysql, mariadb, redis, mongo, mssql.
 
+If the `depot` MCP server is connected, prefer its tools (`list_databases`,
+`create_database`, `get_connection`, `get_usage`, ...) over the shell commands.
+
 Removing deletes data for good: confirm with the person first, and prefer
 `--keep-data` when unsure. Containers created by `omarchy-install-docker-dbs`
 show up too; they have no password (except MongoDB and SQL Server's defaults),

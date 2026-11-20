@@ -15,6 +15,10 @@
 class Backend : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantList databases READ databases NOTIFY changed)
+    // Names change far less often than the data, and a list keyed on them
+    // keeps its delegates (and keyboard focus) while stats tick.
+    Q_PROPERTY(QStringList names READ names NOTIFY namesChanged)
+    Q_PROPERTY(QVariantMap totals READ totals NOTIFY changed)
     Q_PROPERTY(QVariantList engineList READ engineList CONSTANT)
     Q_PROPERTY(bool loaded READ loaded NOTIFY changed)
     Q_PROPERTY(QString dockerProblem READ dockerProblem NOTIFY changed)
@@ -31,6 +35,9 @@ public:
                      int refreshInterval = 3000);
 
     QVariantList databases() const;
+    QStringList names() const { return m_names; }
+    QVariantMap totals() const;
+    static constexpr int historyLength = 60;
     QVariantList engineList() const;
     bool loaded() const { return m_loaded; }
     QString dockerProblem() const { return m_dockerProblem; }
@@ -54,6 +61,7 @@ public:
 
 signals:
     void changed();
+    void namesChanged();
     void notice(const QString &message, bool error);
     void created(const QString &name);
 
@@ -63,6 +71,8 @@ private:
     void docker(const QStringList &args, Done done) { run(m_docker, args, std::move(done)); }
     void tailscale(const QStringList &args, Done done) { run(m_tailscale, args, std::move(done)); }
     void finishRefreshStep();
+    void sampleStats();
+    void publish();
     void readDockerProblem(const QByteArray &err);
     const Database *find(const QString &name) const;
     bool portTaken(int port) const;
@@ -76,6 +86,13 @@ private:
     Tailnet m_tailnet;
     QHash<QString, QString> m_pending;  // Name to engine, while docker run works
     QSet<QString> m_busy;
+    QStringList m_names;
+
+    QTimer m_statsTimer;
+    bool m_sampling = false;
+    QHash<QString, Stats> m_stats;
+    QHash<QString, QList<double>> m_cpuHistory;
+    QHash<QString, QList<double>> m_memoryHistory;
 
     QList<Database> m_nextDatabases;
     QSet<int> m_nextServed;
