@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+# A stand-in for the tailscale CLI: a connected node and its TCP serve config,
+# kept in $FAKE_STATE/serve.json.
+import json, os, sys
+
+state = os.path.join(os.environ["FAKE_STATE"], "serve.json")
+served = json.load(open(state)) if os.path.exists(state) else {}
+args = sys.argv[1:]
+
+if args == ["status", "--json"]:
+    print(json.dumps({"BackendState": "Running", "Self": {
+        "HostName": "workstation", "DNSName": "workstation.tail1234.ts.net.",
+        "TailscaleIPs": ["100.64.0.7", "fd7a:115c:a1e0::7"]}}))
+elif args == ["serve", "status", "--json"]:
+    print(json.dumps({"TCP": {p: {"TCPForward": t} for p, t in served.items()}} if served else {}))
+elif args[:3] == ["serve", "--bg", "--tcp"]:
+    served[args[3]] = args[4].removeprefix("tcp://")
+    json.dump(served, open(state, "w"))
+elif args[:2] == ["serve", "--tcp"] and args[3:] == ["off"]:
+    served.pop(args[2], None)
+    json.dump(served, open(state, "w"))
+else:
+    sys.exit("fake tailscale: unsupported " + " ".join(args))

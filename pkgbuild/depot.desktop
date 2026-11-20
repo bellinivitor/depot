@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Depot
+Comment=Create local databases and share them on your tailnet
+Comment[pt_BR]=Crie bancos de dados locais e compartilhe na sua tailnet
+Exec=depot
+Icon=depot
+Terminal=false
+Categories=Development;Database;
+Keywords=database;postgres;mysql;redis;mongodb;docker;tailscale;
+StartupWMClass=depot

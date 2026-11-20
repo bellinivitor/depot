@@ -1,0 +1,12 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="Main.qml">Main.qml</file>
+        <file alias="AccentButton.qml">AccentButton.qml</file>
+        <file alias="DatabaseRow.qml">DatabaseRow.qml</file>
+        <file alias="CreateDialog.qml">CreateDialog.qml</file>
+        <file alias="RemoveDialog.qml">RemoveDialog.qml</file>
+        <file alias="HelpOverlay.qml">HelpOverlay.qml</file>
+        <file alias="i18n/pt-BR.json">i18n/pt-BR.json</file>
+        <file alias="skill/SKILL.md">skill/SKILL.md</file>
+    </qresource>
+</RCC>
