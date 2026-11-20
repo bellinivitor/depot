@@ -37,7 +37,16 @@ Dialog {
     readonly property string nameError: backend.nameProblem(nameField.text)
     readonly property string portError: backend.portProblem(parseInt(portField.text) || 0)
     readonly property string passwordError: backend.passwordProblem(engine, passwordField.text)
-    readonly property bool valid: nameError === "" && portError === "" && passwordError === ""
+    // A removed database left its data under this name. Its password lives
+    // in that data, so mounting it as is would quietly keep the old one:
+    // the person has to choose between keeping it and starting over.
+    readonly property bool leftover: backend.leftoverNames.indexOf(nameField.text) >= 0
+    property string dataChoice: ""
+    onLeftoverChanged: dataChoice = ""
+    readonly property string reuseProblem: backend.reuseProblem(engine)
+    readonly property bool dataChosen: !leftover || dataChoice === "fresh"
+                                       || (dataChoice === "reuse" && reuseProblem === "")
+    readonly property bool valid: nameError === "" && portError === "" && passwordError === "" && dataChosen
 
     function cycle(step) {
         const list = backend.engineList
@@ -49,12 +58,14 @@ Dialog {
         pick(list[i].id)
     }
 
+    // Suggestions skip names in use and names with data left behind.
     function suggestedName() {
         const base = version === "" || version === versions[0] ? engine : engine + version.replace(/\./g, "")
-        if (backend.nameProblem(base) === "")
+        const free = name => backend.nameProblem(name) === "" && backend.leftoverNames.indexOf(name) < 0
+        if (free(base))
             return base
         for (let i = 2; ; ++i)
-            if (backend.nameProblem(base + "-" + i) === "")
+            if (free(base + "-" + i))
                 return base + "-" + i
     }
 
@@ -75,8 +86,26 @@ Dialog {
     function submit() {
         if (!valid)
             return
-        backend.create(engine, nameField.text, parseInt(portField.text), shareBox.checked, passwordField.text, version)
+        if (leftover && dataChoice === "fresh") {
+            freshConfirm.open()
+            return
+        }
+        createNow(leftover ? dataChoice : "")
+    }
+
+    function createNow(existingData) {
+        backend.create(engine, nameField.text, parseInt(portField.text), shareBox.checked, passwordField.text,
+                       version, existingData)
         close()
+    }
+
+    ConfirmDialog {
+        id: freshConfirm
+        title: qsTr("Delete the old data of %1?").arg(nameField.text)
+        message: qsTr("Every table and row in %1 is gone for good, and %2 starts empty.")
+                 .arg("depot-" + nameField.text).arg(nameField.text)
+        confirmText: qsTr("Delete and create")
+        onConfirmed: dialog.createNow("fresh")
     }
 
     onAboutToShow: {
@@ -96,8 +125,8 @@ Dialog {
         onActivated: dialog.submit()
     }
     // Text fields are one line, so up and down are free to pick the engine.
-    Shortcut { sequences: ["Up", "Ctrl+K"]; enabled: dialog.visible; onActivated: dialog.cycle(-1) }
-    Shortcut { sequences: ["Down", "Ctrl+J"]; enabled: dialog.visible; onActivated: dialog.cycle(1) }
+    Shortcut { sequences: ["Up", "Ctrl+K"]; enabled: dialog.visible && !freshConfirm.visible; onActivated: dialog.cycle(-1) }
+    Shortcut { sequences: ["Down", "Ctrl+J"]; enabled: dialog.visible && !freshConfirm.visible; onActivated: dialog.cycle(1) }
     Shortcut { sequence: "Ctrl+T"; enabled: dialog.visible && shareBox.enabled; onActivated: shareBox.checked = !shareBox.checked }
 
     ColumnLayout {
@@ -225,12 +254,66 @@ Dialog {
         }
 
         Label {
-            visible: !dialog.valid && (nameField.text !== "" || passwordField.text !== "")
+            // Only when there is something to say: an unchosen leftover keeps
+            // Create off without being an error.
+            visible: text !== "" && (nameField.text !== "" || passwordField.text !== "")
             text: dialog.nameError !== "" ? dialog.nameError : dialog.portError !== "" ? dialog.portError : dialog.passwordError
             color: theme.red
             font.pixelSize: 12
             Layout.fillWidth: true
             wrapMode: Text.Wrap
+        }
+
+        Rectangle {
+            visible: dialog.leftover
+            Layout.fillWidth: true
+            implicitHeight: leftoverColumn.implicitHeight + 24
+            radius: theme.radius
+            color: theme.tint(theme.yellow, 0.08)
+            border.color: theme.tint(theme.yellow, 0.4)
+
+            ColumnLayout {
+                id: leftoverColumn
+                anchors.fill: parent
+                anchors.margins: 12
+                spacing: 8
+
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    color: theme.textBright
+                    text: "󰀦  " + qsTr("A removed database left its data under this name, in %1. Its password is kept in that data, so choose what to do with it.")
+                          .arg("depot-" + nameField.text)
+                }
+                RowLayout {
+                    spacing: 8
+                    DepotButton {
+                        compact: true
+                        kind: dialog.dataChoice === "reuse" ? "primary" : "ghost"
+                        glyph: dialog.dataChoice === "reuse" ? "󰄬" : ""
+                        text: qsTr("Keep the data")
+                        enabled: dialog.reuseProblem === ""
+                        onClicked: dialog.dataChoice = "reuse"
+                    }
+                    DepotButton {
+                        compact: true
+                        kind: "danger"
+                        glyph: dialog.dataChoice === "fresh" ? "󰄬" : "󰩺"
+                        text: qsTr("Delete it and start over")
+                        onClicked: dialog.dataChoice = "fresh"
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    font.pixelSize: 12
+                    color: dialog.dataChoice === "fresh" ? theme.red : theme.textDim
+                    text: dialog.reuseProblem !== "" && dialog.dataChoice !== "fresh" ? dialog.reuseProblem
+                        : dialog.dataChoice === "reuse" ? qsTr("Keeps every table and sets the new password inside the database.")
+                        : dialog.dataChoice === "fresh" ? qsTr("Deletes every table in that data before creating. It asks once more.")
+                        : qsTr("Pick one to create it.")
+                }
+            }
         }
 
         CheckBox {

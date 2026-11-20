@@ -190,6 +190,25 @@ QHash<QString, Stats> parseStats(const QByteArray &jsonLines) {
     return result;
 }
 
+QSet<QString> parseVolumes(const QByteArray &lines) {
+    QSet<QString> volumes;
+    for (const auto &line : QString::fromUtf8(lines).split('\n', Qt::SkipEmptyParts))
+        if (line.trimmed().startsWith("depot-"))
+            volumes.insert(line.trimmed());
+    return volumes;
+}
+
+QString reuseProblem(const QString &engine) {
+    // Both change their admin password only for someone logged in as that
+    // admin, and Depot doesn't keep the old password once a database is gone.
+    if (engine == "mongo" || engine == "mssql")
+        return QCoreApplication::translate("Depot", "%1 only changes its admin password for someone who knows the old "
+                                                    "one, which Depot doesn't keep. Start over with fresh data, or "
+                                                    "pick another name.")
+            .arg(engineById(engine)->label);
+    return {};
+}
+
 QSet<int> parseServedPorts(const QByteArray &json) {
     QSet<int> ports;
     const auto tcp = QJsonDocument::fromJson(json).object().value("TCP").toObject();

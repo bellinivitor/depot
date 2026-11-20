@@ -33,10 +33,16 @@ void usage(QTextStream &stream) {
     stream << "Usage: depot [command]\n\n"
               "  open                         Open the window (the default)\n"
               "  list [--json]                List the databases on this machine\n"
-              "  create <engine> [name] [--version V] [--port N] [--password P] [--no-expose] [--json]\n"
+              "  create <engine> [name] [--version V] [--port N] [--password P] [--no-expose]\n"
+              "         [--reuse-data | --fresh] [--json]\n"
               "                               Create a database, with the password \"postgres\" unless\n"
               "                               one is given, and share it on the tailnet. See\n"
-              "                               `depot versions` for the engines\n"
+              "                               `depot versions` for the engines. When a removed\n"
+              "                               database left data under the name, it stops and\n"
+              "                               asks: --reuse-data keeps the data and sets the new\n"
+              "                               password; --fresh DELETES the old data first\n"
+              "  discard-data <name>          Delete the data a removed database left behind\n"
+              "                               (cannot be undone)\n"
               "  start <name>                 Start a database\n"
               "  stop <name>                  Stop a database\n"
               "  expose <name>                Share a database on the tailnet\n"
@@ -108,6 +114,8 @@ int runCli(const QStringList &arguments) {
                        .arg(database.name, engineById(database.engine)->label, database.state)
                        .arg(database.port)
                        .arg(now.shared(database) ? "tailnet" : "local");
+        for (const auto &leftover : now.leftoverNames())
+            out << QString("%1\t-\tremoved, data kept in %2\n").arg(leftover, volumeName(leftover));
         return 0;
     }
 
@@ -137,7 +145,18 @@ int runCli(const QStringList &arguments) {
                 return fail("give the version after --version");
             args.remove(versionFlag, qMin(2, int(args.size() - versionFlag)));
         }
-        const auto created = ops::create(now, args.value(0), args.value(1), port, share, password, version);
+        const bool reuse = args.removeAll("--reuse-data") > 0;
+        const bool fresh = args.removeAll("--fresh") > 0;
+        if (reuse && fresh)
+            return fail("pick one: --reuse-data keeps the old data, --fresh deletes it");
+        const auto existing = reuse ? ops::ExistingData::Reuse
+                            : fresh ? ops::ExistingData::Fresh : ops::ExistingData::Refuse;
+        const auto created = ops::create(now, args.value(0), args.value(1), port, share, password, version, existing);
+        if (created.leftoverData)
+            return fail(created.error + "\n"
+                        "Its password stays the old one unless Depot sets it, so choose:\n"
+                        "  --reuse-data  keep the tables and set the new password\n"
+                        "  --fresh       delete the old data and start over (cannot be undone)");
         if (created.database.name.isEmpty())
             return fail(created.error);
         const auto item = toVariant(created.database, created.shared, now.tailnet);
@@ -146,6 +165,12 @@ int runCli(const QStringList &arguments) {
         else
             out << item.value(created.shared ? "url" : "localUrl").toString() << Qt::endl;
         return created.error.isEmpty() ? 0 : fail(created.error);
+    }
+
+    if (command == "discard-data") {
+        if (args.value(0).isEmpty())
+            return fail("name it: depot discard-data <name>");
+        return done(ops::discardData(now, args.value(0)));
     }
 
     const QString name = args.value(0);

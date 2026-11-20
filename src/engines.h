@@ -83,6 +83,13 @@ QHash<QString, Stats> parseStats(const QByteArray &jsonLines);
 // "9.355MiB", "19.2MB", "126B" to bytes; Docker mixes binary and decimal units.
 double parseSize(const QString &text);
 
+// Depot's data volumes from `docker volume ls -q`: only depot-<name> ones.
+QSet<QString> parseVolumes(const QByteArray &lines);
+
+// Empty when Depot can keep an engine's old data and still set a new
+// password; otherwise why it can't.
+QString reuseProblem(const QString &engine);
+
 // The TCP ports `tailscale serve status --json` forwards.
 QSet<int> parseServedPorts(const QByteArray &json);
 

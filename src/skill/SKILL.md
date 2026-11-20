@@ -24,15 +24,23 @@ depot start app | depot stop app
 depot expose app | depot unexpose app
 depot remove app                     # removes the container AND its data
 depot remove app --keep-data         # keeps the depot-app volume
+depot create postgres app --reuse-data # recreate on that data, setting the new password
+depot create postgres app --fresh    # DELETE that data, then create
+depot discard-data app               # DELETE data a removed database left behind
 ```
 
 Engines: postgres, mysql, mariadb, redis, mongo, mssql.
 
 If the `depot` MCP server is connected, prefer its tools (`list_databases`,
 `create_database`, `get_connection`, `get_usage`, ...) over the shell commands.
+There, keeping old data is `existing_data: "reuse"` on `create_database`, and
+starting over is `discard_data` followed by `create_database`.
 
 Removing deletes data for good: confirm with the person first, and prefer
-`--keep-data` when unsure. Containers created by `omarchy-install-docker-dbs`
+`--keep-data` when unsure. Creating a database whose name has data left
+behind fails until it is told what to do: ask the person whether to keep the
+tables (`--reuse-data`; not possible for mongo and mssql) or start over
+(`--fresh`, destructive). Never pick for them. Containers created by `omarchy-install-docker-dbs`
 show up too; they have no password (except MongoDB and SQL Server's defaults),
 so warn before exposing them.
 

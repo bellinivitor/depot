@@ -84,9 +84,31 @@ depot versions                       # the versions each engine offers
 depot url app --local
 depot start app | depot stop app
 depot expose app | depot unexpose app
-depot remove app --keep-data
+depot remove app --keep-data          # the data stays in the depot-app volume
+depot create postgres app --reuse-data  # keep that data, set the new password
+depot create postgres app --fresh       # delete that data first (cannot be undone)
+depot discard-data app                # delete data a removed database left behind
 depot skill install                  # teaches Claude Code to drive Depot
 ```
+
+## Removed databases and their data
+
+Removing a database keeps its data unless you say otherwise, in the Docker
+volume `depot-<name>`. The official images read their password only when they
+set up empty data, so a new database on that old data would quietly keep the
+old password. Creating one with that name again therefore stops and asks:
+
+- **Keep the data** (`--reuse-data`, or `existing_data: "reuse"` over MCP):
+  Depot mounts it, waits for the database, and sets the new password inside it.
+  PostgreSQL and MariaDB need nothing else; MySQL needs root's current
+  password, and Depot tries the new one, an empty one, and `postgres` before
+  giving up; Redis and ClickHouse take the password on every start. MongoDB and
+  SQL Server only change it for someone who knows the old one, so they can't.
+- **Start over** (`--fresh`, or `discard_data` then `create_database` over MCP):
+  Depot deletes that data first. This cannot be undone, and the window asks
+  once more.
+
+`depot list` and the MCP's `list_databases` show the data left behind.
 
 ## For AI agents (MCP)
 
@@ -114,10 +136,14 @@ Or, in any client that takes a JSON config:
 | `start_database` / `stop_database` | Start or stop one |
 | `share_database` | Share it on the tailnet, or stop |
 | `remove_database` | Remove it; the data stays unless `delete_data` is set |
+| `discard_data` | Delete the data a removed database left behind |
 
 The defaults lean safe for an agent: nothing is shared on the tailnet unless
-asked, removal keeps the data volume, and tools are annotated so clients can
-ask before the destructive one.
+asked, removal keeps the data volume, recreating over old data stops until
+someone chooses, and the two tools that delete data are annotated as
+destructive so clients ask first. MCP annotations belong to a tool, not to a
+call, which is why deleting old data is its own tool rather than a
+`create_database` option.
 
 ## Development
 

@@ -10,7 +10,9 @@
 
 #include "backend.h"
 #include "engines.h"
+#include "cli.h"
 #include "mcp.h"
+#include "operations.h"
 #include "theme.h"
 #include "translator.h"
 
@@ -315,14 +317,15 @@ private slots:
         QVERIFY(mcp::handle(QJsonDocument::fromJson(R"({"jsonrpc":"2.0","method":"notifications/initialized"})").object()).isNull());
 
         const auto tools = mcp::tools();
-        QCOMPARE(tools.size(), 8);
+        QCOMPARE(tools.size(), 9);
         for (const auto &value : tools) {
             const auto tool = value.toObject();
             QVERIFY(!tool.value("description").toString().isEmpty());
             QCOMPARE(tool.value("inputSchema").toObject().value("type").toString(), QString("object"));
             const auto hints = tool.value("annotations").toObject();
-            // Only removal destroys anything, and every reader says so.
-            QCOMPARE(hints.value("destructiveHint").toBool(), tool.value("name").toString() == "remove_database");
+            // Only the tools that delete data say they destroy, and every reader says it only reads.
+            const QString toolName = tool.value("name").toString();
+            QCOMPARE(hints.value("destructiveHint").toBool(), toolName == "remove_database" || toolName == "discard_data");
             if (tool.value("name").toString().startsWith("list") || tool.value("name").toString().startsWith("get"))
                 QVERIFY(hints.value("readOnlyHint").toBool());
         }
@@ -407,6 +410,234 @@ private slots:
 
         qunsetenv("DEPOT_DOCKER");
         qunsetenv("DEPOT_TAILSCALE");
+    }
+
+    void mcpAsksAboutLeftoverData()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        qputenv("DEPOT_DOCKER", tools.docker.toUtf8());
+        qputenv("DEPOT_TAILSCALE", tools.tailscale.toUtf8());
+        auto call = [](const QString &tool, const QJsonObject &args) {
+            return mcp::handle({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", tool}, {"arguments", args}}}})
+                .toObject().value("result").toObject();
+        };
+        const QJsonObject pg{{"engine", "postgres"}, {"name", "pg"}, {"port", 5440}, {"password", "first-pass"}};
+        QVERIFY(!call("create_database", pg).value("isError").toBool());
+        QVERIFY(!call("remove_database", {{"name", "pg"}}).value("isError").toBool());
+        QCOMPARE(call("list_databases", {}).value("structuredContent").toObject().value("leftover_data").toArray(),
+                 QJsonArray{"pg"});
+
+        // Without a choice it stops and names both ways out.
+        const auto refused = call("create_database", pg);
+        QVERIFY(refused.value("isError").toBool());
+        const QString text = refused.value("content").toArray().first().toObject().value("text").toString();
+        QVERIFY(text.contains("existing_data") && text.contains("discard_data"));
+        // Starting over is its own, destructive tool, never a flag here.
+        QJsonObject fresh = pg;
+        fresh["existing_data"] = "fresh";
+        QVERIFY(call("create_database", fresh).value("isError").toBool());
+        QCOMPARE(volumePassword(state, "depot-pg"), QString("first-pass"));
+
+        QJsonObject reuse = pg;
+        reuse["password"] = "second-pass";
+        reuse["existing_data"] = "reuse";
+        QVERIFY(!call("create_database", reuse).value("isError").toBool());
+        QCOMPARE(volumePassword(state, "depot-pg"), QString("second-pass"));
+
+        QVERIFY(call("discard_data", {{"name", "pg"}}).value("isError").toBool());   // In use
+        QVERIFY(!call("remove_database", {{"name", "pg"}}).value("isError").toBool());
+        QVERIFY(!call("discard_data", {{"name", "pg"}}).value("isError").toBool());
+        QVERIFY(!call("create_database", pg).value("isError").toBool());              // Clean name again
+        qunsetenv("DEPOT_DOCKER");
+        qunsetenv("DEPOT_TAILSCALE");
+    }
+
+    // Recreating a removed database whose data was kept: the old data holds
+    // the old password, so create() must stop, or set the new one, or start
+    // from empty data, and never show a password the database won't take.
+    void recreateStopsOnLeftoverData()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        QVERIFY(ops::create(ops::load(tools), "postgres", "pg", 5440, false, "first-pass").error.isEmpty());
+        QVERIFY(ops::remove(ops::load(tools), "pg", false).isEmpty());  // Keeps the data
+
+        const auto now = ops::load(tools);
+        QVERIFY(now.hasLeftoverData("pg"));
+        QCOMPARE(now.leftoverNames(), QStringList{"pg"});
+        const auto refused = ops::create(now, "postgres", "pg", 5440, false, "second-pass");
+        QVERIFY(refused.leftoverData);
+        QVERIFY(refused.error.contains("depot-pg"));
+        QVERIFY(ops::load(tools).find("pg") == nullptr);           // Nothing started
+        QCOMPARE(volumePassword(state, "depot-pg"), QString("first-pass"));
+    }
+
+    void reusingPostgresDataSetsTheNewPassword()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        ops::create(ops::load(tools), "postgres", "pg", 5440, false, "first-pass");
+        ops::remove(ops::load(tools), "pg", false);
+
+        // A quote in the password must reach SQL escaped, not break it.
+        const auto reused = ops::create(ops::load(tools), "postgres", "pg", 5440, false, "new'pass-1", {},
+                                        ops::ExistingData::Reuse);
+        QVERIFY2(reused.error.isEmpty(), qPrintable(reused.error));
+        QCOMPARE(reused.database.password, QString("new'pass-1"));
+        QCOMPARE(volumePassword(state, "depot-pg"), QString("new'pass-1"));
+        const auto calls = execLog(state);
+        QVERIFY(calls.contains("pg_isready"));
+        QVERIFY(calls.contains("ALTER USER postgres WITH PASSWORD 'new''pass-1';"));
+    }
+
+    void reusingMysqlDataNeedsTheOldPassword()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        ops::create(ops::load(tools), "mysql", "shop", 3307, false, "first-pass");
+        ops::remove(ops::load(tools), "shop", false);
+
+        // MySQL wants root's current password, which a removed database took
+        // with it: refuse clearly, take the container back down, keep the data.
+        const auto refused = ops::create(ops::load(tools), "mysql", "shop", 3307, false, "second-pass", {},
+                                         ops::ExistingData::Reuse);
+        QVERIFY(refused.database.name.isEmpty());
+        QVERIFY(refused.error.contains("current one"));
+        QVERIFY(refused.error.contains("depot-shop"));
+        QVERIFY(ops::load(tools).find("shop") == nullptr);
+        QCOMPARE(volumePassword(state, "depot-shop"), QString("first-pass"));
+
+        // Depot's own default is one it tries, so a database made with a
+        // blank password can take a new one.
+        QVERIFY(ops::discardData(ops::load(tools), "shop").isEmpty());
+        ops::create(ops::load(tools), "mysql", "shop", 3307, false, "");
+        ops::remove(ops::load(tools), "shop", false);
+        const auto reused = ops::create(ops::load(tools), "mysql", "shop", 3307, false, "other-pass\\1", {},
+                                        ops::ExistingData::Reuse);
+        QVERIFY2(reused.error.isEmpty(), qPrintable(reused.error));
+        QCOMPARE(volumePassword(state, "depot-shop"), QString("other-pass\\1"));
+        QVERIFY(execLog(state).contains("IDENTIFIED BY 'other-pass\\\\1'"));
+    }
+
+    void reusingMariadbDataUsesTheSocket()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        ops::create(ops::load(tools), "mariadb", "maria", 3308, false, "first-pass");
+        ops::remove(ops::load(tools), "maria", false);
+        const auto reused = ops::create(ops::load(tools), "mariadb", "maria", 3308, false, "second-pass", {},
+                                        ops::ExistingData::Reuse);
+        QVERIFY2(reused.error.isEmpty(), qPrintable(reused.error));
+        QCOMPARE(volumePassword(state, "depot-maria"), QString("second-pass"));
+        const auto calls = execLog(state);
+        QVERIFY(calls.contains("mariadb-admin"));
+        QVERIFY(calls.contains("ALTER USER IF EXISTS 'root'@'%' IDENTIFIED BY 'second-pass'"));
+        QVERIFY(calls.contains("ALTER USER IF EXISTS 'root'@'localhost' IDENTIFIED BY 'second-pass'"));
+    }
+
+    void reusingRedisAndClickhouseNeedsNoAlter()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        for (const QString &engine : {"redis", "clickhouse"}) {
+            ops::create(ops::load(tools), engine, engine, 0, false, "first-pass");
+            ops::remove(ops::load(tools), engine, false);
+            const auto reused = ops::create(ops::load(tools), engine, engine, 0, false, "second-pass", {},
+                                            ops::ExistingData::Reuse);
+            QVERIFY2(reused.error.isEmpty(), qPrintable(reused.error));
+            QCOMPARE(volumePassword(state, "depot-" + engine), QString("second-pass"));
+        }
+        const auto calls = execLog(state);
+        QVERIFY(!calls.contains("ALTER"));
+        QVERIFY(calls.contains("clickhouse-client"));  // ClickHouse's password is checked, not assumed
+    }
+
+    void reuseIsRefusedWhereItCannotWork()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        for (const QString &engine : {"mongo", "mssql"}) {
+            const QString password = engine == "mssql" ? "First-pass1" : "first-pass";
+            ops::create(ops::load(tools), engine, engine, 0, false, password);
+            ops::remove(ops::load(tools), engine, false);
+            const auto refused = ops::create(ops::load(tools), engine, engine, 0, false, password, {},
+                                             ops::ExistingData::Reuse);
+            QVERIFY(refused.database.name.isEmpty());
+            QVERIFY(!refused.error.isEmpty());
+            QVERIFY(ops::load(tools).find(engine) == nullptr);   // Refused before starting anything
+        }
+    }
+
+    void freshStartDeletesTheOldDataFirst()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        ops::create(ops::load(tools), "postgres", "pg", 5440, false, "first-pass");
+        ops::remove(ops::load(tools), "pg", false);
+        const auto fresh = ops::create(ops::load(tools), "postgres", "pg", 5440, false, "second-pass", {},
+                                       ops::ExistingData::Fresh);
+        QVERIFY2(fresh.error.isEmpty(), qPrintable(fresh.error));
+        QFile removed(state.path() + "/removed-volumes");
+        QVERIFY(removed.open(QIODevice::ReadOnly));
+        QCOMPARE(removed.readAll(), QByteArray("depot-pg\n"));
+        QCOMPARE(volumePassword(state, "depot-pg"), QString("second-pass"));
+        QVERIFY(!execLog(state).contains("ALTER"));
+    }
+
+    void discardingDataOnlyTakesLeftovers()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        ops::create(ops::load(tools), "postgres", "pg", 5440, false, "first-pass");
+        QVERIFY(!ops::discardData(ops::load(tools), "pg").isEmpty());       // Still in use
+        QVERIFY(!ops::discardData(ops::load(tools), "nothing").isEmpty());  // Nothing there
+        ops::remove(ops::load(tools), "pg", false);
+        QVERIFY(ops::discardData(ops::load(tools), "pg").isEmpty());
+        QVERIFY(!ops::load(tools).volumes.contains("depot-pg"));
+    }
+
+    void commandLineAsksBeforeTouchingOldData()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        qputenv("DEPOT_DOCKER", tools.docker.toUtf8());
+        qputenv("DEPOT_TAILSCALE", tools.tailscale.toUtf8());
+        auto cli = [](QStringList args) { return runCli(QStringList{"depot"} + args); };
+        QCOMPARE(cli({"create", "postgres", "pg", "--port", "5440", "--no-expose", "--password", "first-pass"}), 0);
+        QCOMPARE(cli({"remove", "pg", "--keep-data"}), 0);
+        QCOMPARE(cli({"create", "postgres", "pg", "--port", "5440", "--no-expose", "--password", "second-pass"}), 1);
+        QCOMPARE(cli({"create", "postgres", "pg", "--no-expose", "--reuse-data", "--fresh"}), 1);
+        QCOMPARE(cli({"create", "postgres", "pg", "--port", "5440", "--no-expose", "--password", "second-pass",
+                      "--reuse-data"}), 0);
+        QCOMPARE(volumePassword(state, "depot-pg"), QString("second-pass"));
+        QCOMPARE(cli({"remove", "pg", "--keep-data"}), 0);
+        QCOMPARE(cli({"create", "postgres", "pg", "--port", "5440", "--no-expose", "--fresh"}), 0);
+        QCOMPARE(volumePassword(state, "depot-pg"), QString("postgres"));
+        qunsetenv("DEPOT_DOCKER");
+        qunsetenv("DEPOT_TAILSCALE");
+    }
+
+    void backendKnowsLeftoversAndReuses()
+    {
+        QTemporaryDir state;
+        const auto tools = fakes(state);
+        ops::create(ops::load(tools), "postgres", "postgres", 5440, false, "first-pass");
+        ops::remove(ops::load(tools), "postgres", false);
+
+        Backend backend(tools.docker, tools.tailscale, nullptr, 0);
+        backend.refresh();
+        QTRY_VERIFY(backend.loaded());
+        QCOMPARE(backend.leftoverNames(), QStringList{"postgres"});
+        // A suggestion never lands on old data.
+        QCOMPARE(backend.suggestName("postgres"), QString("postgres-2"));
+
+        backend.create("postgres", "postgres", 5440, false, "second-pass", {}, "reuse");
+        QTRY_VERIFY_WITH_TIMEOUT(backend.databases().size() == 1
+                                     && backend.databases().value(0).toMap().value("state") == "running", 10000);
+        QCOMPARE(backend.leftoverNames(), QStringList());
+        QCOMPARE(volumePassword(state, "depot-postgres"), QString("second-pass"));
     }
 
     void backendReportsDockerPermission()
@@ -531,6 +762,38 @@ private slots:
     }
 
 private:
+    // A fresh fake docker and tailscale in a temporary directory.
+    static ops::Tools fakes(const QTemporaryDir &state)
+    {
+        qputenv("FAKE_STATE", state.path().toUtf8());
+        return {FAKES "/docker", FAKES "/tailscale"};
+    }
+
+    static QString volumePassword(const QTemporaryDir &state, const QString &volume)
+    {
+        QFile file(state.path() + "/volumes.json");
+        if (!file.open(QIODevice::ReadOnly))
+            return {};
+        return QJsonDocument::fromJson(file.readAll()).object().value(volume).toObject().value("password").toString();
+    }
+
+    // Every `docker exec`, as one string to search.
+    static QString execLog(const QTemporaryDir &state)
+    {
+        QFile file(state.path() + "/exec.log");
+        if (!file.open(QIODevice::ReadOnly))
+            return {};
+        QString text;
+        for (const auto &line : file.readAll().split('\n')) {
+            const auto call = QJsonDocument::fromJson(line).object();
+            QStringList command;
+            for (const auto &part : call.value("command").toArray())
+                command << part.toString();
+            text += command.join(' ') + "\n" + call.value("stdin").toString() + "\n";
+        }
+        return text;
+    }
+
     static void write(const QString &path, const QByteArray &contents)
     {
         QFile file(path);

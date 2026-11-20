@@ -578,14 +578,28 @@ ApplicationWindow {
 
                             // How to reach it: always from this machine, for the projects
                             // here, and from the tailnet too while it is shared.
-                            Label {
+                            RowLayout {
                                 visible: win.ready
+                                Layout.fillWidth: true
                                 Layout.topMargin: 6
-                                text: qsTr("CONNECTION")
-                                font.pixelSize: 11
-                                font.weight: Font.DemiBold
-                                font.letterSpacing: 1
-                                color: theme.textDim
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: qsTr("CONNECTION")
+                                    font.pixelSize: 11
+                                    font.weight: Font.DemiBold
+                                    font.letterSpacing: 1
+                                    color: theme.textDim
+                                }
+                                // One switch for everything hidden in the card: the
+                                // password and the URLs that carry it.
+                                DepotButton {
+                                    visible: win.selected !== null && win.selected.password !== ""
+                                    kind: "quiet"
+                                    compact: true
+                                    glyph: win.revealPassword ? "󰈉" : "󰈈"
+                                    text: win.revealPassword ? qsTr("Hide") : qsTr("Show")
+                                    onClicked: win.revealPassword = !win.revealPassword
+                                }
                             }
 
                             Rectangle {
@@ -630,9 +644,7 @@ ApplicationWindow {
                                         label: qsTr("Password")
                                         value: win.selected ? win.selected.password : ""
                                         secret: value
-                                        revealable: true
                                         revealed: win.revealPassword
-                                        onReveal: win.revealPassword = !win.revealPassword
                                     }
                                     ConnectionField {
                                         label: win.selected && win.selected.extraPorts && win.selected.extraPorts.length > 0

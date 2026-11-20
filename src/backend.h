@@ -19,6 +19,9 @@ class Backend : public QObject {
     // keeps its delegates (and keyboard focus) while stats tick.
     Q_PROPERTY(QStringList names READ names NOTIFY namesChanged)
     Q_PROPERTY(QVariantMap totals READ totals NOTIFY changed)
+    // Removed databases whose data was kept: creating one of these names
+    // again has to choose between that data and a fresh start.
+    Q_PROPERTY(QStringList leftoverNames READ leftoverNames NOTIFY changed)
     Q_PROPERTY(QVariantList engineList READ engineList CONSTANT)
     Q_PROPERTY(bool loaded READ loaded NOTIFY changed)
     Q_PROPERTY(QString dockerProblem READ dockerProblem NOTIFY changed)
@@ -37,6 +40,7 @@ public:
     QVariantList databases() const;
     QStringList names() const { return m_names; }
     QVariantMap totals() const;
+    QStringList leftoverNames() const;
     static constexpr int historyLength = 60;
     QVariantList engineList() const;
     bool loaded() const { return m_loaded; }
@@ -49,8 +53,12 @@ public:
 
     Q_INVOKABLE void refresh();
     // An empty password means Depot generates one.
+    // existingData is "reuse" or "fresh" when the name has leftover data.
     Q_INVOKABLE void create(const QString &engine, const QString &name, int port, bool expose,
-                            const QString &password = {}, const QString &version = {});
+                            const QString &password = {}, const QString &version = {},
+                            const QString &existingData = {});
+    // Empty when the engine can keep old data and take a new password.
+    Q_INVOKABLE QString reuseProblem(const QString &engine) const { return ::reuseProblem(engine); }
     Q_INVOKABLE void setRunning(const QString &name, bool running);
     Q_INVOKABLE void setExposed(const QString &name, bool exposed);
     Q_INVOKABLE void remove(const QString &name, bool deleteData);
@@ -92,6 +100,7 @@ private:
 
     QList<Database> m_databases;
     QSet<int> m_served;
+    QSet<QString> m_volumes;
     Tailnet m_tailnet;
     QHash<QString, QString> m_pending;  // Name to engine, while docker run works
     QHash<QString, QString> m_pendingImages;
@@ -106,6 +115,7 @@ private:
 
     QList<Database> m_nextDatabases;
     QSet<int> m_nextServed;
+    QSet<QString> m_nextVolumes;
     Tailnet m_nextTailnet;
     QString m_nextTailscaleProblem;
     int m_refreshSteps = 0;

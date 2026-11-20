@@ -10,6 +10,7 @@
         <file alias="ConnectionSection.qml">ConnectionSection.qml</file>
         <file alias="CreateDialog.qml">CreateDialog.qml</file>
         <file alias="RemoveDialog.qml">RemoveDialog.qml</file>
+        <file alias="ConfirmDialog.qml">ConfirmDialog.qml</file>
         <file alias="HelpOverlay.qml">HelpOverlay.qml</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="i18n/pt-BR.json">i18n/pt-BR.json</file>

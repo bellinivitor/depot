@@ -1,6 +1,9 @@
 #include "backend.h"
+#include "operations.h"
 
 #include <QClipboard>
+#include <QFutureWatcher>
+#include <QtConcurrent>
 #include <QGuiApplication>
 #include <QHostAddress>
 #include <QLocale>
@@ -64,7 +67,8 @@ void Backend::readDockerProblem(const QByteArray &err) {
 void Backend::refresh() {
     if (m_refreshSteps > 0)
         return;
-    m_refreshSteps = 3;
+    m_refreshSteps = 4;
+    m_nextVolumes.clear();
     m_nextDatabases.clear();
     m_nextServed.clear();
     m_nextTailnet = {};
@@ -111,6 +115,13 @@ void Backend::refresh() {
     tailscale({"serve", "status", "--json"}, [this](bool ok, const QByteArray &out, const QByteArray &) {
         if (ok)
             m_nextServed = parseServedPorts(out);
+        finishRefreshStep();
+    });
+
+    // Data that outlived its container: a name to warn about when reused.
+    docker({"volume", "ls", "-q", "--filter", "name=depot-"}, [this](bool ok, const QByteArray &out, const QByteArray &) {
+        if (ok)
+            m_nextVolumes = parseVolumes(out);
         finishRefreshStep();
     });
 }
@@ -168,6 +179,7 @@ void Backend::finishRefreshStep() {
     // rather than a stale list.
     m_databases = m_dockerProblem.isEmpty() ? m_nextDatabases : QList<Database>();
     m_served = m_nextServed;
+    m_volumes = m_nextVolumes;
     m_tailnet = m_nextTailnet;
     m_tailscaleProblem = m_nextTailscaleProblem;
     const bool first = !m_loaded;
@@ -304,11 +316,24 @@ int Backend::suggestPort(const QString &engine) const {
 }
 
 QString Backend::suggestName(const QString &engine) const {
+    // Skip names with data left behind too, so a suggestion never lands on
+    // someone's old tables.
     for (int i = 1;; ++i) {
         const QString name = i == 1 ? engine : QString("%1-%2").arg(engine).arg(i);
-        if (!find(name) && !m_pending.contains(name))
+        if (!find(name) && !m_pending.contains(name) && !m_volumes.contains(volumeName(name)))
             return name;
     }
+}
+
+QStringList Backend::leftoverNames() const {
+    QStringList names;
+    for (const auto &volume : m_volumes) {
+        const QString name = volume.mid(QString("depot-").size());
+        if (!find(name) && !m_pending.contains(name))
+            names << name;
+    }
+    names.sort();
+    return names;
 }
 
 QString Backend::nameProblem(const QString &name) const {
@@ -329,45 +354,40 @@ QString Backend::portProblem(int port) const {
 }
 
 void Backend::create(const QString &engineId, const QString &name, int port, bool expose, const QString &password,
-                     const QString &version) {
+                     const QString &version, const QString &existingData) {
     const Engine *engine = engineById(engineId);
     if (!engine || !engine->version(version) || !nameProblem(name).isEmpty() || !portProblem(port).isEmpty()
         || !::passwordProblem(engineId, password).isEmpty())
         return;
 
     m_pending.insert(name, engineId);
+    m_pendingImages.insert(name, engine->image(version));
     publish();
 
-    m_pendingImages.insert(name, engine->image(version));
-    // Extra ports take the engine's usual numbers when free, like the main one.
-    QList<int> extras;
-    for (const auto &extra : engine->extraPorts) {
-        int candidate = extra.port;
-        while (candidate < 65535 && (candidate == port || extras.contains(candidate) || portTaken(candidate)))
-            ++candidate;
-        extras << candidate;
-    }
-    docker(createArgs(*engine, name, port, passwordFor(engineId, password), version, extras),
-           [this, name, port, extras, expose](bool ok, const QByteArray &, const QByteArray &err) {
+    // The same create the command line and MCP run, waiting on docker and on
+    // the database itself when old data needs its password set, so it runs
+    // off the window's thread.
+    const ops::Tools tools{m_docker, m_tailscale};
+    const auto existing = existingData == "reuse" ? ops::ExistingData::Reuse
+                        : existingData == "fresh" ? ops::ExistingData::Fresh : ops::ExistingData::Refuse;
+    auto *watcher = new QFutureWatcher<ops::Created>(this);
+    connect(watcher, &QFutureWatcher<ops::Created>::finished, this, [this, watcher, name] {
+        const ops::Created outcome = watcher->result();
+        watcher->deleteLater();
         m_pending.remove(name);
         m_pendingImages.remove(name);
-        if (!ok) {
-            emit notice(tr("Couldn't create %1: %2").arg(name, QString::fromUtf8(err).trimmed()), true);
-            refresh();
-            return;
+        if (outcome.database.name.isEmpty()) {
+            emit notice(tr("Couldn't create %1: %2").arg(name, outcome.error), true);
+        } else {
+            emit created(name);
+            if (!outcome.error.isEmpty())
+                emit notice(outcome.error, true);
         }
-        emit created(name);
-        if (!expose) {
-            refresh();
-            return;
-        }
-        serveAll(QList<int>{port} + extras, true, [this, name](bool ok, const QByteArray &, const QByteArray &err) {
-            if (!ok)
-                emit notice(tr("%1 is running, but sharing it on the tailnet failed: %2")
-                                .arg(name, QString::fromUtf8(err).trimmed()), true);
-            refresh();
-        });
+        refresh();
     });
+    watcher->setFuture(QtConcurrent::run([=] {
+        return ops::create(ops::load(tools), engineId, name, port, expose, password, version, existing);
+    }));
 }
 
 void Backend::setRunning(const QString &name, bool running) {

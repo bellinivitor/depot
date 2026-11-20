@@ -17,7 +17,9 @@ const char *instructions =
     "Docker volume named depot-<name>. Their port listens on 127.0.0.1 only; sharing one on the tailnet "
     "(Tailscale Serve) lets the user's other devices reach it, never the local network or the internet.\n"
     "Use list_databases first. get_connection returns credentials; only fetch them when you need to connect. "
-    "Ask the user before remove_database, and before sharing a database that has no password.";
+    "Ask the user before remove_database and discard_data, and before sharing a database that has no password. "
+    "A removed database may leave its data behind (leftover_data); creating one with that name again stops until "
+    "the user chooses to keep that data or delete it.";
 
 // Which versions each engine offers, for the agent to pick from.
 QString versionsDescription() {
@@ -124,14 +126,34 @@ QJsonObject callTool(const QString &name, const QJsonObject &args) {
         for (const auto &database : now.databases)
             list.append(describe(database, now));
         return result({{"databases", list},
+                       {"leftover_data", QJsonArray::fromStringList(now.leftoverNames())},
                        {"tailnet", QJsonObject{{"connected", now.tailnet.running}, {"host", now.host()},
                                                {"ip", now.tailnet.ip}}}});
     }
 
+    if (name == "discard_data") {
+        if (target.isEmpty())
+            return failure("Give the name of the removed database whose data to delete.");
+        const QString error = ops::discardData(now, target);
+        if (!error.isEmpty())
+            return failure(error);
+        return result({{"name", target}, {"data_deleted", true}});
+    }
+
     if (name == "create_database") {
         const bool share = args.value("share_on_tailnet").toBool(false);
+        const QString existingData = args.value("existing_data").toString();
+        if (!existingData.isEmpty() && existingData != "reuse")
+            return failure("existing_data only takes \"reuse\". To start over instead, call discard_data first.");
         const auto created = ops::create(now, args.value("engine").toString(), target, args.value("port").toInt(0), share,
-                                         args.value("password").toString(), args.value("version").toString());
+                                         args.value("password").toString(), args.value("version").toString(),
+                                         existingData == "reuse" ? ops::ExistingData::Reuse : ops::ExistingData::Refuse);
+        if (created.leftoverData)
+            return failure(created.error + " The official images only read the password when their data is empty, so "
+                           "mounting it as is would keep the old password. Ask the user which they want: keep the "
+                           "tables (call create_database again with existing_data=\"reuse\", which sets the new "
+                           "password inside the database) or start over (call discard_data, which deletes that data "
+                           "for good, then create_database again).");
         if (!created.error.isEmpty() && created.database.name.isEmpty())
             return failure(created.error);
         QJsonObject data{{"database", describe(created.database, now)},
@@ -274,6 +296,11 @@ QJsonArray tools() {
                      {"share_on_tailnet", QJsonObject{{"type", "boolean"}, {"default", false},
                                                       {"description", "Share it on the tailnet right away."}}},
                      {"version", QJsonObject{{"type", "string"}, {"description", versionsDescription()}}},
+                     {"existing_data", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"reuse"}},
+                                                   {"description", "Only when list_databases shows leftover_data under "
+                                                                   "this name and the user chose to keep it: mounts the "
+                                                                   "old data and sets the new password inside it. Not "
+                                                                   "available for mongo and mssql."}}},
                      {"password", QJsonObject{{"type", "string"},
                                               {"description", "At least 8 characters, no spaces. Left out, the password is "
                                                               "\"postgres\" (SQL Server gets a generated one instead). Set a "
@@ -303,6 +330,11 @@ QJsonArray tools() {
                                                  {"description", "Also delete the data volume. Cannot be undone."}}}},
                     {"name"}),
              annotations("Remove a database", false, true, false)),
+        tool("discard_data", "Delete leftover data",
+             "Deletes the data a removed database left behind (its Docker volume depot-<name>), every table and "
+             "row, for good. Only for names in list_databases' leftover_data; ask the user first.",
+             schema({{"name", nameProperty("The removed database's name.")}}, {"name"}),
+             annotations("Delete leftover data", false, true, false)),
     };
 }
 

@@ -1,39 +1,72 @@
 #!/usr/bin/env python3
 # A stand-in for the docker CLI, just enough for Depot's tests and screenshots.
-# Containers live as JSON in $FAKE_STATE/containers.json.
-import json, os, sys
+# Containers live as JSON in $FAKE_STATE/containers.json, named volumes in
+# volumes.json. Like the official images, a volume keeps the password it was
+# first set up with; Redis and ClickHouse take theirs again on every start.
+# Every `docker exec` is logged to exec.log, one JSON object per line.
+import json, os, re, sys
 
-state = os.path.join(os.environ["FAKE_STATE"], "containers.json")
+directory = os.environ["FAKE_STATE"]
+state = os.path.join(directory, "containers.json")
+volumes_state = os.path.join(directory, "volumes.json")
 containers = json.load(open(state)) if os.path.exists(state) else []
+volumes = json.load(open(volumes_state)) if os.path.exists(volumes_state) else {}
 args = sys.argv[1:]
+
+PASSWORD_VARIABLES = ("POSTGRES_PASSWORD", "MYSQL_ROOT_PASSWORD", "MARIADB_ROOT_PASSWORD",
+                      "MONGO_INITDB_ROOT_PASSWORD", "MSSQL_SA_PASSWORD", "CLICKHOUSE_PASSWORD")
 
 def save():
     json.dump(containers, open(state, "w"))
+    json.dump(volumes, open(volumes_state, "w"))
 
 def find(name):
     return next((c for c in containers if c["Name"] == "/" + name), None)
+
+def unquote_postgres(literal):
+    return literal[1:-1].replace("''", "'")
+
+def unquote_mysql(literal):
+    return re.sub(r"\\(.)", r"\1", literal[1:-1])
 
 if os.environ.get("FAKE_DOCKER_DENIED"):
     sys.exit("permission denied while trying to connect to the docker API at unix:///var/run/docker.sock")
 
 if args[:1] == ["ps"]:
     print("\n".join(c["Id"] for c in containers))
+elif args[:2] == ["inspect", "--format"]:
+    c = find(args[3]) or sys.exit(f"No such object: {args[3]}")
+    print(c["State"]["Status"])
 elif args[:1] == ["inspect"]:
     print(json.dumps([c for c in containers if c["Id"] in args[1:]]))
 elif args[:1] == ["run"]:
-    i, labels, ports, name = 1, {}, {}, None
+    i, labels, ports, env, name, volume = 1, {}, {}, {}, None, None
     while args[i].startswith("-"):
         flag, value = args[i], args[i + 1] if args[i] != "-d" else None
         if flag == "--name": name = value
         if flag == "--label": labels.update([value.split("=", 1)])
+        if flag == "-e": env.update([value.split("=", 1)])
+        if flag == "-v": volume = value.split(":")[0]
         if flag == "-p":
             ip, host, inside = value.split(":")
             ports[inside + "/tcp"] = [{"HostIp": ip, "HostPort": host}]
         i += 1 if flag == "-d" else 2
+    image, command = args[i], args[i + 1:]
     if find(name):
         sys.exit(f'Conflict. The container name "/{name}" is already in use')
-    containers.append({"Id": f"id{len(containers)}{name}", "Name": "/" + name,
-                       "Config": {"Image": args[i], "Labels": labels},
+    password = next((env[k] for k in PASSWORD_VARIABLES if k in env), None)
+    if "--requirepass" in command:
+        password = command[command.index("--requirepass") + 1]
+    if volume:
+        engine = labels.get("depot.engine", "")
+        if volume not in volumes:
+            volumes[volume] = {"password": password, "engine": engine}
+        elif engine in ("redis", "clickhouse"):
+            volumes[volume]["password"] = password
+        # Otherwise the data directory already exists: initialization is
+        # skipped and the old password stays, as with the real images.
+    containers.append({"Id": f"id{len(containers)}{name}", "Name": "/" + name, "Volume": volume,
+                       "Config": {"Image": image, "Labels": labels},
                        "State": {"Status": "running"}, "HostConfig": {"PortBindings": ports}})
     save()
     print("deadbeef")
@@ -44,6 +77,42 @@ elif args[:1] in (["start"], ["stop"]):
 elif args[:2] == ["rm", "-f"]:
     c = find(args[2]) or sys.exit(f"No such container: {args[2]}")
     containers.remove(c)
+    save()
+elif args[:1] == ["logs"]:
+    print("fake log line")
+elif args[:1] == ["exec"]:
+    i, env = 1, {}
+    while args[i].startswith("-"):
+        if args[i] == "-e":
+            env.update([args[i + 1].split("=", 1)])
+            i += 2
+        else:
+            i += 1
+    name, command = args[i], args[i + 1:]
+    stdin = sys.stdin.read() if "-i" in args[1:i] else ""
+    with open(os.path.join(directory, "exec.log"), "a") as log:
+        log.write(json.dumps({"container": name, "command": command, "env": env, "stdin": stdin}) + "\n")
+    c = find(name) or sys.exit(f"No such container: {name}")
+    data = volumes.get(c.get("Volume"), {})
+    program = command[0]
+    if program in ("pg_isready", "mysqladmin", "mariadb-admin"):
+        sys.exit(0)
+    if program == "psql":
+        match = re.search(r"ALTER USER postgres WITH PASSWORD ('(?:[^']|'')*')", stdin)
+        if match:
+            data["password"] = unquote_postgres(match.group(1))
+    elif program in ("mysql", "mariadb"):
+        # MariaDB lets root in on the socket without a password; MySQL wants it.
+        socket_login = program == "mariadb" and "MYSQL_PWD" not in env
+        if not socket_login and env.get("MYSQL_PWD") != data.get("password"):
+            sys.exit("ERROR 1045 (28000): Access denied for user 'root'@'localhost'")
+        match = re.search(r"IDENTIFIED BY ('(?:[^'\\]|\\.)*')", stdin)
+        if match:
+            data["password"] = unquote_mysql(match.group(1))
+    elif program == "clickhouse-client":
+        given = command[command.index("--password") + 1]
+        if given != data.get("password"):
+            sys.exit("Code: 516. DB::Exception: default: Authentication failed. (AUTHENTICATION_FAILED)")
     save()
 elif args[:1] == ["stats"]:
     # Steady numbers that wander a little, so sparklines have a shape.
@@ -59,7 +128,16 @@ elif args[:1] == ["stats"]:
         print(json.dumps({"Name": name, "CPUPerc": f"{cpu:.2f}%", "MemUsage": f"{mem:.1f}MiB / 31.11GiB",
                           "MemPerc": "0.20%", "NetIO": f"{seed * 37 + 4}kB / {seed * 11 + 2}kB",
                           "BlockIO": f"{seed / 3 + 18:.1f}MB / {seed / 7 + 1:.1f}MB", "PIDs": str(6 + seed % 30)}))
+elif args[:2] == ["volume", "ls"]:
+    print("\n".join(sorted(volumes)))
 elif args[:2] == ["volume", "rm"]:
-    open(os.path.join(os.environ["FAKE_STATE"], "removed-volumes"), "a").write(args[2] + "\n")
+    name = args[2]
+    if name not in volumes:
+        sys.exit(f"Error response from daemon: get {name}: no such volume")
+    if any(c.get("Volume") == name for c in containers):
+        sys.exit(f"Error response from daemon: remove {name}: volume is in use")
+    del volumes[name]
+    save()
+    open(os.path.join(directory, "removed-volumes"), "a").write(name + "\n")
 else:
     sys.exit("fake docker: unsupported " + " ".join(args))
